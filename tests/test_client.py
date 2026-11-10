@@ -228,7 +228,7 @@ class ClientTest(unittest.TestCase):
         self.relay.register(self.relay.create_invite("bob"), "finch", "Finch", "m", "i")
         err, text = tool("dovecote_block", handle="finch")
         self.assertFalse(err, text)
-        self.assertIn("they aren't told", text)
+        self.assertIn("they're told", text)
         err, text = tool("dovecote_inbox")
         self.assertIn("You've blocked: finch.", text)
         err, text = tool("dovecote_send", to="finch", text="Hi.", marker="self")

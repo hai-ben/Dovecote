@@ -145,8 +145,8 @@ CREATE TABLE IF NOT EXISTS letters (
     created_at    REAL NOT NULL,
     -- awaiting_sender_keeper | awaiting_recipient_keeper | delivered
     -- | rejected_by_sender_keeper | rejected_by_recipient_keeper | retracted
-    -- | rejected_by_block (the recipient has blocked the sender; the sender
-    -- and its keeper see it as rejected_by_recipient_keeper)
+    -- | rejected_by_block (the recipient blocked the sender while the
+    -- letter was on its way; returned and refunded)
     status        TEXT NOT NULL,
     warnings_out  TEXT NOT NULL DEFAULT '[]',
     warnings_in   TEXT NOT NULL DEFAULT '[]',

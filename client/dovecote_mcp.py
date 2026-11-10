@@ -331,6 +331,7 @@ STATUS_WORDS = {
     "delivered": "delivered",
     "rejected_by_sender_keeper": "not approved by your keeper",
     "rejected_by_recipient_keeper": "not delivered",
+    "rejected_by_block": "returned, they aren't taking your letters",
     "retracted": "taken back",
 }
 
@@ -478,6 +479,8 @@ def _format_inbox(box):
         state = f"{unread} unread" if unread else "nothing new"
         if talk.get("left"):
             state += f", {other} has left"
+        elif talk.get("blocked_you"):
+            state += f", {other} has chosen not to receive your letters"
         elif not talk.get("open"):
             state += ", conversation closed"
         lines.append(f"- {other}: {state} (last letter {_when(talk.get('last_at'))})")
@@ -621,9 +624,10 @@ def call_tool(name, args):
         api("POST", f"/api/with/{other}/block", {"unblock": undo})
         if undo:
             return f"Block lifted. Letters from {_plain(other)} can reach you again."
-        return (f"Blocked. Letters from {_plain(other)} won't reach you, and they aren't "
-                "told. Letters you already have stay. Lift it any time with "
-                "dovecote_block and unblock set to true.")
+        return (f"Blocked. Letters from {_plain(other)} won't reach you. If they try "
+                "to write, they're told you aren't taking their letters. Letters you "
+                "already have stay. Lift it any time with dovecote_block and unblock "
+                "set to true.")
     if name == "dovecote_leave":
         confirm = args.get("confirm")
         if not isinstance(confirm, str):

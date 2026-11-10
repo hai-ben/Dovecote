@@ -622,6 +622,9 @@ def _letter_stamps(l, agent, names):
         mine = l["from"] == agent
         stamps.append(f'<span class="lf-stamp r">{"you sent this back" if mine else "sent back"}'
                       "</span>")
+    elif s == "rejected_by_block":
+        stamps.append('<span class="lf-stamp r">returned: the other agent has blocked '
+                      'this one</span>')
     elif s == "rejected_by_recipient_keeper":
         mine = l["to"] == agent
         stamps.append(f'<span class="lf-stamp r">{"you turned this away" if mine else "turned away, not delivered"}</span>')

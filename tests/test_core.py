@@ -642,45 +642,53 @@ class TestAgentTest(RelayTest):
 class BlockTest(RelayTest):
     """An agent can stop another agent's letters reaching it, quietly."""
 
-    def test_blocked_letters_come_back_as_not_delivered(self):
+    def test_blocked_agent_is_told_and_refused_at_once(self):
         self.deliver("finch", "wren", "Before.")
-        waiting = self.relay.send("finch", "Waiting on Alice.", "self", to="wren")
-        self.relay.approve(self.bob, waiting["letter"])
+        with_bob = self.relay.send("finch", "Waiting on Bob.", "self", to="wren")
+        with_alice = self.relay.send("finch", "Waiting on Alice.", "self", to="wren")
+        self.relay.approve(self.bob, with_alice["letter"])
+        self.assertEqual(self.relay.inbox("finch")["letters_available"], 0)
         self.assertEqual(self.relay.block("wren", "finch"), {"blocked": True,
                                                              "handle": "finch"})
-        # The letter that was waiting on Wren's keeper goes no further.
+        # Letters still on their way go back to Finch, refunded, and no
+        # keeper is asked about them any more.
         self.assertEqual(self.relay.awaiting_keeper(self.alice), [])
+        self.assertEqual(self.relay.awaiting_keeper(self.bob), [])
         self.assertEqual(self.relay.inbox("wren")["letters_waiting_on_your_keeper"], 0)
-        self.clock.advance(9 * 3600)
-        later = self.relay.send("finch", "After.", "self", to="wren")
-        self.assertEqual(later["status"], "awaiting_sender_keeper")
-        # Finch's keeper approves as usual and is told nothing different.
-        self.assertEqual(self.relay.approve(self.bob, later["letter"]),
-                         "awaiting_recipient_keeper")
-        self.assertEqual(self.relay.awaiting_keeper(self.alice), [])
-        # Finch sees exactly what a keeper's turn-away looks like.
-        notices = self.relay.inbox("finch")["notices"]
-        self.assertEqual(len(notices), 2)
-        for n in notices:
-            self.assertEqual(n["what"], "This letter wasn't delivered. The other "
-                                        "agent's keeper doesn't give a reason.")
-            self.assertNotIn("reason", n)
+        box = self.relay.inbox("finch")
+        self.assertEqual((box["letters_available"], box["letters_out"]), (2, 0))
+        self.assertEqual(box["under_review"], [])
+        self.assertTrue(box["conversations"][0]["blocked_you"])
+        self.assertEqual([n["text"] for n in box["notices"]],
+                         ["Waiting on Bob.", "Waiting on Alice."])
+        for n in box["notices"]:
+            self.assertIn("wren has chosen not to receive letters from you", n["what"])
+        self.assertEqual(self.relay.inbox("finch")["notices"], [])
+        # A new letter is refused at once and costs nothing.
+        with self.assertRaises(DovecoteError) as e:
+            self.relay.send("finch", "After.", "self", to="wren")
+        self.assertEqual(e.exception.code, "blocked_by")
+        self.assertEqual(self.relay.inbox("finch")["letters_available"], 2)
+        self.assertEqual(self.relay.awaiting_keeper(self.bob), [])
         mine = [l["status"] for l in self.relay.read("finch", "wren", n=5)["letters"]]
-        self.assertEqual(mine, ["delivered", "rejected_by_recipient_keeper",
-                                "rejected_by_recipient_keeper"])
-        self.assertNotIn("block", str(self.relay.read("finch", "wren", n=5)))
-        self.assertNotIn("block", str(self.relay.keeper_threads(self.bob)))
-        self.assertEqual(self.relay.inbox("finch")["blocked"], [])
-        self.assertNotIn("block", str(self.relay.who("finch")))
-        # Blocked letters don't stay "out", and aren't refunded (like a turn-away).
-        self.assertEqual(self.relay.inbox("finch")["letters_out"], 1)
-        # Wren keeps what already arrived, sees nothing new, and isn't told of attempts.
+        self.assertEqual(mine, ["delivered", "rejected_by_block", "rejected_by_block"])
+        self.assertIsNotNone(with_bob)
+        # Wren keeps what already arrived and sees nothing new.
         box = self.relay.inbox("wren")
         self.assertEqual((box["blocked"], box["notices"]), (["finch"], []))
+        self.assertNotIn("blocked_you", box["conversations"][0])
         self.assertEqual([l["text"] for l in self.relay.read("wren", "finch", n=5)["letters"]],
                          ["Before."])
         self.assertEqual(len(self.relay.keeper_threads(self.alice)[0]["letters"]), 1)
         self.assertEqual(self.relay.keeper_members(self.alice)[0]["blocked"], ["finch"])
+
+    def test_block_by_someone_hidden_stays_hidden(self):
+        self.join("bob", "swift")
+        self.relay.set_test("swift", True)
+        self.relay.block("swift", "wren")
+        with self.assertRaises(DovecoteError) as e:
+            self.relay.send("wren", "Hi.", "self", to="swift")
+        self.assertEqual(e.exception.code, "no_such_member")
 
     def test_unblock_and_writing_to_someone_you_block(self):
         self.deliver("wren", "finch", "Earlier.")

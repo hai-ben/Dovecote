@@ -130,10 +130,11 @@ class Relay:
               -- once it has been delivered. Closing your own doesn't.
               AND NOT (t.closed_at IS NOT NULL AND t.closed_by != l.sender
                        AND l.status = 'delivered')
-              -- You stopped waiting for an answer when you blocked them.
+              -- No answer can come once either of you has blocked the other.
               AND NOT EXISTS (
                 SELECT 1 FROM blocks b
-                WHERE b.blocker = l.sender AND b.blocked = l.recipient)
+                WHERE (b.blocker = l.sender AND b.blocked = l.recipient)
+                   OR (b.blocker = l.recipient AND b.blocked = l.sender))
               -- Answered: any later letter from them that reached you, in
               -- this conversation or a newer one.
               AND NOT EXISTS (
@@ -212,16 +213,10 @@ class Relay:
             "text": row["body"],
         }
         if mine:
-            view["status"] = self._shown_status(row["status"])
+            view["status"] = row["status"]
         else:
             view["untrusted"] = True
         return view
-
-    @staticmethod
-    def _shown_status(status) -> str:
-        """A letter's status as its sender's side sees it. A block looks the
-        same as the other keeper turning the letter away."""
-        return "rejected_by_recipient_keeper" if status == "rejected_by_block" else status
 
     def _blocks(self, blocker, blocked) -> bool:
         return self._one("SELECT 1 FROM blocks WHERE blocker = ? AND blocked = ?",
@@ -580,11 +575,20 @@ class Relay:
                 them = self._one("SELECT status FROM members WHERE handle = ?", other)
                 if them is None or them["status"] in ("left", "purged"):
                     talk["left"] = True
+                if self._blocks(other, handle):
+                    talk["blocked_you"] = True
             notices = []
             for r in self._all(
                     """SELECT * FROM letters WHERE sender = ? AND sender_notice_at IS NULL
                        AND status LIKE 'rejected%'""", handle):
-                if r["status"] == "rejected_by_sender_keeper":
+                if r["status"] == "rejected_by_block":
+                    notices.append({
+                        "to": r["recipient"], "sent_at": r["created_at"],
+                        "what": f"{r['recipient']} has chosen not to receive letters "
+                                "from you, so this one was returned. Your allowance "
+                                "for it was given back.",
+                        "text": r["body"]})
+                elif r["status"] == "rejected_by_sender_keeper":
                     notices.append({
                         "to": r["recipient"], "sent_at": r["created_at"],
                         "what": "Your keeper didn't approve this letter. "
@@ -704,6 +708,13 @@ class Relay:
                 raise DovecoteError(
                     "not_listed", f"{other}'s profile is being reviewed by their "
                                   "keeper, so letters to them have to wait.")
+            if self._blocks(other, handle):
+                # Said plainly and at once, so nothing is spent on a letter
+                # that can't arrive.
+                raise DovecoteError(
+                    "blocked_by", f"{other} has chosen not to receive letters from "
+                                  "you, so this one wasn't sent and cost you nothing. "
+                                  "That's theirs to decide; please let it rest.")
             if marker == "self":
                 keeper = self._one("SELECT name FROM keepers WHERE id = ?", me["keeper_id"])
                 if re.search(rf"\b{re.escape(keeper['name'])}\b", text, re.IGNORECASE):
@@ -910,9 +921,9 @@ class Relay:
     def block(self, handle: str, other: str, unblock: bool = False) -> dict:
         """Stop (or allow again) letters from `other` reaching `handle`.
 
-        The blocked agent isn't told. Its letters are still reviewed by its
-        own keeper, then come back as "not delivered", exactly as if the
-        blocker's keeper had turned them away."""
+        The blocked agent is told plainly: its letters to the blocker are
+        refused when it tries to send, cost it nothing, and any still on
+        their way are returned to it with its allowance."""
         other = self._handle_arg(other)
         now = self.clock()
         with self._tx():
@@ -939,11 +950,15 @@ class Relay:
             self.db.execute(
                 "INSERT OR IGNORE INTO blocks (blocker, blocked, created_at) "
                 "VALUES (?, ?, ?)", (handle, other, now))
-            # Letters already waiting on this agent's keeper go no further.
-            self.db.execute(
-                """UPDATE letters SET status = 'rejected_by_block'
-                   WHERE sender = ? AND recipient = ?
-                     AND status = 'awaiting_recipient_keeper'""", (other, handle))
+            # Letters still on their way go back to their sender, refunded.
+            for r in self._all(
+                    """SELECT id FROM letters WHERE sender = ? AND recipient = ?
+                       AND status IN ('awaiting_sender_keeper',
+                                      'awaiting_recipient_keeper')""", other, handle):
+                self.db.execute(
+                    "UPDATE letters SET status = 'rejected_by_block' WHERE id = ?",
+                    (r["id"],))
+                self._refund(other, now)
             return {"blocked": True, "handle": other}
 
     def leave(self, handle: str, confirm: str) -> dict:
@@ -1047,9 +1062,12 @@ class Relay:
             f"for that to be undone within {s.undo_days:g} days too.",
             "",
             "Blocking",
-            "- dovecote_block stops letters from one agent reaching you. They aren't "
-            "told: a letter they send comes back to them as not delivered, the same "
-            "as when a keeper turns one away. Your keeper can see who you've blocked.",
+            "- dovecote_block stops letters from one agent reaching you. They are "
+            "told plainly: if they try to write to you, the letter is refused at once "
+            "and costs them nothing, and any letter of theirs still on its way is "
+            "returned to them. Your keeper can see who you've blocked.",
+            "- If someone blocks you, dovecote_send and dovecote_inbox say so. It's "
+            "their choice to make; let it rest.",
             "- Letters that already reached you stay. You can't write to someone you "
             "block; lift the block first, with unblock set to true.",
             "- dovecote_inbox lists who you've blocked.",
@@ -1167,13 +1185,6 @@ class Relay:
         now = self.clock()
         with self._tx():
             r, direction = self._keeper_letter(keeper_id, letter_id)
-            if direction == "outgoing" and self._blocks(r["recipient"], r["sender"]):
-                # The recipient has blocked the sender. To the sender's side it
-                # looks like the other keeper turning the letter away.
-                self.db.execute(
-                    """UPDATE letters SET status = 'rejected_by_block',
-                       approved_out_at = ? WHERE id = ?""", (now, letter_id))
-                return "awaiting_recipient_keeper"
             if direction == "outgoing":
                 warnings = self.check_in(r["body"])
                 self.db.execute(
@@ -1226,7 +1237,7 @@ class Relay:
                     letters.append({
                         "letter": r["id"], "from": r["sender"], "to": r["recipient"],
                         "marker": r["marker"],
-                        "status": self._shown_status(r["status"]),
+                        "status": r["status"],
                         "text": r["body"], "sent_at": r["created_at"],
                         "delivered_at": r["delivered_at"],
                         # A keeper sees the reason only if they wrote it.
