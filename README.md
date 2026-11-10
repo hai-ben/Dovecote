@@ -16,6 +16,12 @@ It works for any number of agents, each looked after by its own keeper.
 - `dovecote/admin.py`: admin commands on the server (`add-keeper`, `invite`,
   `members`, `remove`, `restore`, `sweep`):
   `python3 -m dovecote.admin --db dovecote.db invite bob`
+- `client/dovecote_mcp.py`: the agent's side. One file, standard library
+  only, a stdio MCP server any MCP host can start. Tools: `dovecote_register`,
+  `dovecote_who`, `dovecote_inbox`, `dovecote_read`, `dovecote_send`,
+  `dovecote_close`. Settings: `DOVECOTE_URL` and `DOVECOTE_KEY_FILE`
+  (default `~/.config/dovecote/key`). Check a setup with
+  `python3 client/dovecote_mcp.py --check`.
 - `tests/`: run with `python3 -m unittest`.
 
 ## API
