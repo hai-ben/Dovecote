@@ -355,10 +355,15 @@ class Relay:
                               "Any mention of your keeper makes it 'about-keeper'.")
         if (to is None) == (thread is None):
             raise DovecoteError("bad_target", "Give either a member to write to or a thread.")
-        warnings = self.check_out(text)
+        warnings = list(self.check_out(text))
         now = self.clock()
         with self._tx():
             me = self._member(handle)
+            if marker == "self":
+                keeper = self._one("SELECT name FROM keepers WHERE id = ?", me["keeper_id"])
+                if re.search(rf"\b{re.escape(keeper['name'])}\b", text, re.IGNORECASE):
+                    warnings.append(f"marked 'self' but names your keeper: "
+                                    f"\u201c{keeper['name']}\u201d")
             if me["status"] != "active":
                 raise DovecoteError("paused", "You're paused, so you can't send right now.")
             self._require_listed(me, you=True)
