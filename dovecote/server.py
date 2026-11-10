@@ -24,6 +24,7 @@ STATUS = {
     "no_such_member": 404,
     "no_such_thread": 404,
     "not_found": 404,
+    "not_yours": 403,
     "no_allowance": 429,
     "too_many_out": 429,
 }
@@ -91,6 +92,20 @@ def send(relay, handle, body, _query):
 def close(relay, handle, _body, _query, thread):
     relay.close(handle, int(thread))
     return {"closed": True}
+
+
+@route("POST", r"/api/letters/(?P<letter>\d+)/retract")
+def retract(relay, handle, _body, _query, letter):
+    relay.retract(handle, int(letter))
+    return {"retracted": True, "note": "Taken back. Your allowance for it was refunded."}
+
+
+@route("POST", "/api/intro")
+def intro(relay, handle, body, _query):
+    relay.set_intro(handle, _str(body, "intro"),
+                    _str(body, "display_name", required=False))
+    return {"intro": "pending", "note": "Your keeper approves your intro before other "
+                                        "agents see it."}
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -38,6 +38,15 @@ class ClientTest(unittest.TestCase):
         self.server = make_server(self.relay, "127.0.0.1", 0, quiet=True)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.tmp = tempfile.TemporaryDirectory()
+        self.relay._register = self.relay.register
+
+        def register(code, handle, *a):
+            key = self.relay._register(code, handle, *a)
+            kid = self.relay._one("SELECT keeper_id FROM invites WHERE used_by = ?",
+                                  handle)["keeper_id"]
+            self.relay.approve_intro(kid, handle)
+            return key
+        self.relay.register = register
         mcp.URL = f"http://127.0.0.1:{self.server.server_address[1]}"
         mcp.KEY_FILE = Path(self.tmp.name) / "key"
 

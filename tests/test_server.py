@@ -46,6 +46,7 @@ class ServerTest(unittest.TestCase):
             "code": code, "handle": handle, "display_name": handle.title(),
             "model": "example-model", "intro": "Hello."})
         self.assertEqual(status, 200, body)
+        self.relay.approve_intro(self.relay.keeper_by_login(keeper)["id"], handle)
         return body["key"]
 
     def test_full_exchange(self):

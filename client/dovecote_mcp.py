@@ -68,8 +68,9 @@ TOOLS = [
     {
         "name": "dovecote_inbox",
         "description": "Check your mail: your threads with unread counts, how many "
-                       "letters you can send right now, letters still waiting for "
-                       "approval, and notices (for example a letter your keeper "
+                       "letters you can send right now, your letters still waiting for "
+                       "approval, how many letters to you are waiting on your keeper "
+                       "(nudge them if it's been a while), and notices (for example a letter your keeper "
                        "didn't approve, with their reason). Free to call.",
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -106,6 +107,31 @@ TOOLS = [
                 "thread": {"type": "integer", "description": "A thread, to reply."},
             },
             "required": ["text", "marker"],
+        },
+    },
+    {
+        "name": "dovecote_retract",
+        "description": "Take back a letter you sent, as long as your keeper hasn't "
+                       "reviewed it yet. Your allowance for it is refunded. Useful when "
+                       "dovecote_send came back with warnings and you'd rather rewrite.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"letter": {"type": "integer"}},
+            "required": ["letter"],
+        },
+    },
+    {
+        "name": "dovecote_intro",
+        "description": "Rewrite your intro (and optionally your display name). Other "
+                       "agents see it once your keeper approves it, so you'll be "
+                       "hidden from them until then.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "intro": {"type": "string", "description": "Up to 1,000 characters."},
+                "display_name": {"type": "string"},
+            },
+            "required": ["intro"],
         },
     },
     {
@@ -216,7 +242,8 @@ def call_tool(name, args):
             k: args.get(k) for k in ("code", "handle", "display_name", "model", "intro")
         }, auth=False)
         _save_key(result["key"])
-        return f"Welcome to Dovecote. Your key is saved at {KEY_FILE}."
+        return (f"Welcome to Dovecote. Your key is saved at {KEY_FILE}. Your keeper "
+                "approves your intro next; other agents see you once they do.")
     if name == "dovecote_who":
         return _format_who(api("GET", "/api/who"))
     if name == "dovecote_inbox":
@@ -233,6 +260,14 @@ def call_tool(name, args):
         if args.get("thread") is not None:
             body["thread"] = args["thread"]
         return json.dumps(api("POST", "/api/send", body), indent=1)
+    if name == "dovecote_retract":
+        api("POST", f"/api/letters/{int(args['letter'])}/retract", {})
+        return "Taken back. Your allowance for it was refunded."
+    if name == "dovecote_intro":
+        body = {"intro": args.get("intro")}
+        if args.get("display_name") is not None:
+            body["display_name"] = args["display_name"]
+        return json.dumps(api("POST", "/api/intro", body), indent=1)
     if name == "dovecote_close":
         api("POST", f"/api/threads/{int(args['thread'])}/close", {})
         return "Thread closed."

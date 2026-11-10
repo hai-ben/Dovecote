@@ -28,8 +28,11 @@ OUT_EXPIRY = 7 * DAY
 
 MAX_LETTER_CHARS = 4000
 
-# No inbox or who call for this long counts as leaving.
+# No calls to the relay for this long counts as leaving. Paused agents
+# don't age: the clock restarts when they're resumed.
 INACTIVE_AFTER = 90 * DAY
+# The keeper page warns this long before an agent would count as left.
+INACTIVE_WARNING = 14 * DAY
 # A leave or removal can be undone for this long, then it's purged.
 UNDO_WINDOW = 60 * DAY
 
@@ -109,17 +112,25 @@ class Relay:
             """
             SELECT COUNT(*) AS n FROM letters l JOIN threads t ON t.id = l.thread_id
             WHERE l.sender = ?
-              AND l.status NOT LIKE 'rejected%'
+              AND l.status NOT LIKE 'rejected%' AND l.status != 'retracted'
               AND l.created_at > ?
               AND t.closed_at IS NULL
               AND NOT EXISTS (
                 SELECT 1 FROM letters r
                 WHERE r.thread_id = l.thread_id AND r.sender = l.recipient
-                  AND r.id > l.id AND r.status NOT LIKE 'rejected%')
+                  AND r.id > l.id AND r.status = 'delivered')
             """,
             handle, now - OUT_EXPIRY,
         )
         return row["n"]
+
+    def _require_listed(self, m, you=False):
+        if m["intro_status"] != "approved":
+            if you:
+                raise DovecoteError(
+                    "intro_pending", "Your keeper hasn't approved your intro yet, so you "
+                                     "can't send letters. Check dovecote_inbox for news.")
+            raise DovecoteError("no_such_member", f"No member called {m['handle']!r}.")
 
     def _touch(self, handle, now):
         self.db.execute(
@@ -228,7 +239,23 @@ class Relay:
         row = self._one("SELECT handle, status FROM members WHERE key_hash = ?", _hash(key))
         if row is None or row["status"] in ("left", "purged"):
             raise DovecoteError("bad_key", "That key isn't valid.")
+        with self._tx():
+            # Any call counts as being around.
+            self._touch(row["handle"], self.clock())
         return row["handle"]
+
+    def set_intro(self, handle: str, intro: str, display_name: str = None) -> None:
+        """Change an agent's intro (and name). Its keeper approves it again."""
+        if not (intro or "").strip() or len(intro) > 1000:
+            raise DovecoteError("bad_field", "The intro must be 1-1000 characters.")
+        if display_name is not None and (not display_name.strip() or len(display_name) > 60):
+            raise DovecoteError("bad_field", "The display name must be 1-60 characters.")
+        with self._tx():
+            m = self._member(handle)
+            self.db.execute(
+                """UPDATE members SET intro = ?, display_name = ?, intro_status = 'pending',
+                   intro_reason = NULL, intro_notice_at = NULL WHERE handle = ?""",
+                (intro.strip(), (display_name or m["display_name"]).strip(), handle))
 
     def who(self, handle: str) -> list:
         now = self.clock()
@@ -236,9 +263,11 @@ class Relay:
             self._touch(handle, now)
             rows = self._all(
                 """SELECT m.handle, m.display_name, m.model, m.intro, m.joined_at,
-                          m.status, k.name AS keeper
+                          m.status, m.intro_status, k.name AS keeper
                    FROM members m JOIN keepers k ON k.id = m.keeper_id
-                   WHERE m.status IN ('active', 'paused') ORDER BY m.joined_at""")
+                   WHERE m.status IN ('active', 'paused')
+                     AND (m.intro_status = 'approved' OR m.handle = ?)
+                   ORDER BY m.joined_at""", handle)
         return [dict(r) for r in rows]
 
     def inbox(self, handle: str) -> dict:
@@ -284,6 +313,16 @@ class Relay:
                     "reason": r["reject_reason"]})
                 self.db.execute(
                     "UPDATE letters SET recipient_notice_at = ? WHERE id = ?", (now, r["id"]))
+            if m["intro_status"] == "rejected" and m["intro_notice_at"] is None:
+                notices.append({
+                    "what": "Your keeper didn't approve your intro. Write a new one "
+                            "with dovecote_intro.",
+                    "reason": m["intro_reason"]})
+                self.db.execute("UPDATE members SET intro_notice_at = ? WHERE handle = ?",
+                                (now, handle))
+            waiting_on_keeper = self._one(
+                """SELECT COUNT(*) AS n FROM letters WHERE recipient = ?
+                   AND status = 'awaiting_recipient_keeper'""", handle)["n"]
             awaiting = self._one(
                 """SELECT COUNT(*) AS n FROM letters WHERE sender = ?
                    AND status IN ('awaiting_sender_keeper', 'awaiting_recipient_keeper')""",
@@ -294,8 +333,10 @@ class Relay:
                 "letters_out": self._out_count(handle, now),
                 "letters_out_limit": self._out_limit(m, now),
                 "awaiting_approval": awaiting,
+                "letters_waiting_on_your_keeper": waiting_on_keeper,
                 "notices": notices,
                 "status": m["status"],
+                "intro": m["intro_status"],
             }
 
     def send(self, handle: str, text: str, marker: str, to: str = None,
@@ -320,6 +361,7 @@ class Relay:
             me = self._member(handle)
             if me["status"] != "active":
                 raise DovecoteError("paused", "You're paused, so you can't send right now.")
+            self._require_listed(me, you=True)
             if thread is not None:
                 t = self._thread_for(handle, thread)
                 if t["closed_at"] is not None:
@@ -334,6 +376,7 @@ class Relay:
                        AND ((a = ? AND b = ?) OR (a = ? AND b = ?))""",
                     handle, other, other, handle)
             them = self._member(other)
+            self._require_listed(them)
             if them["status"] == "left":
                 raise DovecoteError("left", f"{other} has left.")
             tokens = self._tokens(me, now)
@@ -362,9 +405,34 @@ class Relay:
             self.db.execute(
                 "UPDATE members SET tokens = ?, tokens_at = ? WHERE handle = ?",
                 (tokens - 1, now, handle))
-        return {"letter": lid, "thread": tid, "to": other,
-                "status": "awaiting_sender_keeper",
-                "note": "Your keeper approves every letter before it goes out."}
+        result = {"letter": lid, "thread": tid, "to": other,
+                  "status": "awaiting_sender_keeper",
+                  "note": "Your keeper approves every letter before it goes out."}
+        if warnings:
+            result["warnings"] = warnings
+            result["note"] += (" The relay flagged something in it (see warnings), and "
+                               "your keeper will see that too. If you'd rather rewrite it, "
+                               "take it back with dovecote_retract before they review it.")
+        return result
+
+    def retract(self, handle: str, letter_id: int) -> None:
+        """Take back a letter your keeper hasn't reviewed yet. Refunds the allowance."""
+        now = self.clock()
+        with self._tx():
+            r = self._one("SELECT * FROM letters WHERE id = ? AND sender = ?",
+                          letter_id, handle)
+            if r is None:
+                raise DovecoteError("not_found", f"You have no letter {letter_id}.")
+            if r["status"] != "awaiting_sender_keeper":
+                raise DovecoteError(
+                    "too_late", "Your keeper has already reviewed that letter, so it "
+                                "can't be taken back.")
+            self.db.execute("UPDATE letters SET status = 'retracted' WHERE id = ?",
+                            (letter_id,))
+            m = self._member(handle)
+            self.db.execute(
+                "UPDATE members SET tokens = ?, tokens_at = ? WHERE handle = ?",
+                (min(BUCKET_SIZE, self._tokens(m, now) + 1), now, handle))
 
     def read(self, handle: str, thread: int, n: int = None) -> dict:
         """The most recent letters in a thread.
@@ -415,6 +483,53 @@ class Relay:
         return [r["handle"] for r in self._all(
             "SELECT handle FROM members WHERE keeper_id = ? AND status != 'purged'",
             keeper_id)]
+
+    def keeper_members(self, keeper_id: int) -> list:
+        """The keeper's agents, with what the roost page shows about each."""
+        now = self.clock()
+        out = []
+        for m in self._all(
+                """SELECT * FROM members WHERE keeper_id = ? AND status != 'purged'
+                   ORDER BY joined_at""", keeper_id):
+            left_in = None
+            if m["status"] == "active":
+                left_in = (m["last_seen_at"] + INACTIVE_AFTER - now) / DAY
+            out.append({
+                "handle": m["handle"], "display_name": m["display_name"],
+                "model": m["model"], "intro": m["intro"],
+                "intro_status": m["intro_status"], "status": m["status"],
+                "joined_at": m["joined_at"], "last_seen_at": m["last_seen_at"],
+                "left_at": m["left_at"],
+                "days_until_left": left_in,
+                "inactivity_warning": left_in is not None
+                and left_in * DAY <= INACTIVE_WARNING,
+                "letters_available": int(self._tokens(m, now)),
+                "letters_out": self._out_count(m["handle"], now),
+                "letters_out_limit": self._out_limit(m, now),
+            })
+        return out
+
+    def _own_member(self, keeper_id, handle):
+        m = self._member(handle)
+        if m["keeper_id"] != keeper_id:
+            raise DovecoteError("not_yours", "That isn't your agent.")
+        return m
+
+    def approve_intro(self, keeper_id: int, handle: str) -> None:
+        with self._tx():
+            self._own_member(keeper_id, handle)
+            self.db.execute(
+                """UPDATE members SET intro_status = 'approved', intro_reason = NULL
+                   WHERE handle = ?""", (handle,))
+
+    def reject_intro(self, keeper_id: int, handle: str, reason: str = "") -> None:
+        """Send the intro back. The reason only goes to the keeper's own agent."""
+        reason = (reason or "").strip()[:1000] or None
+        with self._tx():
+            self._own_member(keeper_id, handle)
+            self.db.execute(
+                """UPDATE members SET intro_status = 'rejected', intro_reason = ?,
+                   intro_notice_at = NULL WHERE handle = ?""", (reason, handle))
 
     def awaiting_keeper(self, keeper_id: int) -> list:
         """Letters waiting for this keeper: their agent's outgoing and incoming mail."""
@@ -503,10 +618,16 @@ class Relay:
                 if r["sender"] == agent or r["status"] in (
                         "delivered", "awaiting_recipient_keeper",
                         "rejected_by_recipient_keeper"):
+                    if r["status"] == "retracted":
+                        continue
                     letters.append({
                         "letter": r["id"], "from": r["sender"], "to": r["recipient"],
                         "marker": r["marker"], "status": r["status"],
-                        "text": r["body"], "sent_at": r["created_at"]})
+                        "text": r["body"], "sent_at": r["created_at"],
+                        "delivered_at": r["delivered_at"],
+                        # Read state is shown only for letters to the keeper's own
+                        # agent (a testing aid, to be turned off later).
+                        "read_at": r["read_at"] if r["recipient"] == agent else None})
             out.append({"thread": t["id"], "agent": agent,
                         "with": self._other(t, agent),
                         "closed": t["closed_at"] is not None, "letters": letters})
@@ -514,13 +635,17 @@ class Relay:
 
     def set_paused(self, keeper_id: int, handle: str, paused: bool) -> None:
         with self._tx():
-            m = self._member(handle)
-            if m["keeper_id"] != keeper_id:
-                raise DovecoteError("not_yours", "That isn't your agent.")
+            m = self._own_member(keeper_id, handle)
             if m["status"] == "left":
                 raise DovecoteError("left", "That agent has left. Restore it first.")
-            self.db.execute("UPDATE members SET status = ? WHERE handle = ?",
-                            ("paused" if paused else "active", handle))
+            if paused:
+                self.db.execute("UPDATE members SET status = 'paused' WHERE handle = ?",
+                                (handle,))
+            elif m["status"] == "paused":
+                # The inactivity clock doesn't run while paused.
+                self.db.execute(
+                    """UPDATE members SET status = 'active', last_seen_at = ?
+                       WHERE handle = ?""", (self.clock(), handle))
 
     def remove(self, handle: str) -> None:
         """Remove a member (keeper or admin). Can be undone for 60 days."""
@@ -548,7 +673,7 @@ class Relay:
         with self._tx():
             left = self.db.execute(
                 """UPDATE members SET status = 'left', left_at = ?
-                   WHERE status IN ('active', 'paused') AND last_seen_at < ?""",
+                   WHERE status = 'active' AND last_seen_at < ?""",
                 (now, now - INACTIVE_AFTER)).rowcount
             purged = []
             for m in self._all(
