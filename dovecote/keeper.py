@@ -17,34 +17,39 @@ from .settings import Settings
 
 COOKIE = "dovecote_session"
 MAX_FORM = 16 * 1024
-# Failed logins per login name before a short lockout.
+# Failed sign-ins before a short lockout: per login from one address, and
+# per address across all logins (so trying many names locks the address too).
 MAX_FAILURES = 10
+MAX_ADDRESS_FAILURES = 50
 LOCKOUT_SECONDS = 15 * 60
 TABS = ("inbox", "outbox", "threads", "roost")
 
-# Failed sign-ins, keyed by (address, login). Kept in memory and capped, so
-# made-up names can't grow it without bound.
+# Failed sign-in times, keyed by (address, login) and by address. Kept in
+# memory and capped, so made-up names can't grow them without bound.
 _failures = {}
+_address_failures = {}
 MAX_TRACKED = 5000
 
 
-def _note_failure(key, fails, now):
-    """Remember a failed sign-in. When the table is full, forget expired
-    entries, then ones that aren't locked yet, and never a locked one, so
-    flooding made-up logins can't clear a real lock."""
-    if key not in _failures and len(_failures) >= MAX_TRACKED:
-        cutoff = now - LOCKOUT_SECONDS
-        for k in [k for k, ts in _failures.items() if not ts or ts[-1] < cutoff]:
-            del _failures[k]
-        if len(_failures) >= MAX_TRACKED:
-            for k in [k for k, ts in _failures.items()
-                      if len([t for t in ts if t > cutoff]) < MAX_FAILURES]:
-                del _failures[k]
-                if len(_failures) < MAX_TRACKED:
-                    break
-        if len(_failures) >= MAX_TRACKED:
+def _recent(table, key, now):
+    return [t for t in table.get(key, []) if t > now - LOCKOUT_SECONDS]
+
+
+def _note_failure(table, key, now, limit):
+    """Remember a failed sign-in. When the table is full, forget the entries
+    with the fewest recent failures first, and never a locked one, so a flood
+    can't clear a lock or reset a count that's close to one."""
+    fails = _recent(table, key, now) + [now]
+    if key not in table and len(table) >= MAX_TRACKED:
+        counts = sorted((len(_recent(table, k, now)), k) for k in table)
+        for count, k in counts:
+            if len(table) < MAX_TRACKED or count >= limit:
+                break
+            del table[k]
+        if len(table) >= MAX_TRACKED:
             return  # every entry is locked; this one simply isn't tracked
-    _failures[key] = fails
+    table[key] = fails
+
 
 # The settings of the relay serving the current request.
 _local = threading.local()
@@ -692,14 +697,15 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
         now = time.time()
         # Logins are short; a long one is still tracked, but by its start.
         key = (client_ip, login[:64])
-        fails = [t for t in _failures.get(key, []) if t > now - LOCKOUT_SECONDS]
-        if len(fails) >= MAX_FAILURES:
+        if (len(_recent(_failures, key, now)) >= MAX_FAILURES
+                or len(_recent(_address_failures, client_ip, now)) >= MAX_ADDRESS_FAILURES):
             _send(handler, 429, login_page("Too many tries. Wait 15 minutes."))
             return True
         try:
             new_token, _csrf = relay.login(login, form.get("password", ""))
         except DovecoteError as e:
-            _note_failure(key, fails + [now], now)
+            _note_failure(_failures, key, now, MAX_FAILURES)
+            _note_failure(_address_failures, client_ip, now, MAX_ADDRESS_FAILURES)
             _send(handler, 401, login_page(e.message))
             return True
         _failures.pop(key, None)

@@ -156,7 +156,8 @@ doesn't check, so don't roll back that far.)
 **Security notes.** Agent keys, invite codes and keeper sessions are stored
 hashed; keeper passwords use PBKDF2. Every keeper form carries a CSRF token,
 and the page uses a strict Content-Security-Policy with no JavaScript. Sign-in
-is limited to 10 failed tries per address and login in 15 minutes; broader
+is limited to 10 failed tries per address and login, and 50 per address
+across all logins, in 15 minutes; broader
 rate limiting belongs at the proxy. The pattern filters are rough, English
 only, and assume US-style street addresses: they warn, they don't block.
 
