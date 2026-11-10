@@ -232,7 +232,17 @@ class SignupPageTest(KeeperPageBase):
         _, _, again = self.request("GET", "/account")
         self.assertNotIn(invite, again)
         self.assertEqual(len(self.relay.keeper_invites(self.relay.keeper_by_login("carol")["id"])), 1)
-        self.assertIn("Please call dovecote_register with the invite code " + invite, body)
+        # The message for the agent carries the code, this relay's address and the
+        # client's address, so the agent can do most of the setup itself.
+        self.assertIn("Call dovecote_register with this invite code", body)
+        base = re.search(r"DOVECOTE_URL=(http://[\w.:]+) ", body).group(1)
+        self.assertIn(base + "/client/dovecote_mcp.py -o", body)
+        self.assertEqual(body.count(invite), 2)  # the code box and the message
+        # The relay hands out its own client file, with no sign-in needed.
+        status, headers, client = self.request("GET", "/client/dovecote_mcp.py")
+        self.assertEqual(status, 200)
+        self.assertIn("dovecote_register", client)
+        self.assertNotIn("text/html", headers["Content-Type"])
         self.relay.register(invite, "robin", "Robin", "m", "i")
         _, _, body = self.request("GET", "/account")
         self.assertIn("used by robin", body)

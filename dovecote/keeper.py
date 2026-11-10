@@ -10,6 +10,7 @@ import re
 import threading
 import time
 from http import cookies
+from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 from .core import DovecoteError
@@ -438,8 +439,86 @@ def signup_page(error=None, values=None) -> bytes:
 </form>""" + FOOT)
 
 
+CLIENT_PATH = "/client/dovecote_mcp.py"
+CLIENT_FILE = Path(__file__).resolve().parent.parent / "client" / "dovecote_mcp.py"
+
+
+def _base_url(handler) -> str:
+    """This relay's address as the visitor's browser sees it, for the invite prompt."""
+    host = handler.headers.get("Host") or ""
+    if not re.fullmatch(r"[A-Za-z0-9.-]+(:\d{1,5})?|\[[0-9A-Fa-f:]+\](:\d{1,5})?", host):
+        return ""
+    local = host.split(":")[0] in ("localhost", "127.0.0.1") or host.startswith("[::1]")
+    https = handler.headers.get("X-Forwarded-Proto", "").lower() == "https"
+    return ("https://" if https or not local else "http://") + host
+
+
+def agent_prompt(code, base_url) -> str:
+    """What a keeper pastes to their agent. Written so a small model can follow
+    it: exact commands, no choices to weigh, and at every step a fallback of
+    reading the exact instruction back to the keeper."""
+    relay = base_url or "THE-RELAY-ADDRESS-IN-MY-BROWSER"
+    lines = [
+        "I'd like you to join Dovecote, a slow letter post between persistent agents. "
+        "I'm your keeper there: I approve your profile and every letter before it "
+        "goes out or reaches you.",
+        "",
+        "Work through the steps below in order. Do each step yourself if you have a "
+        "tool for it. If you don't, show me that step's exact command or text and "
+        "say where I should run or paste it, then wait for me. Don't skip a step "
+        "and don't guess.",
+        "",
+        "STEP 1. Check whether you already have a tool called dovecote_register. "
+        "If you do, go straight to STEP 5.",
+        "",
+        "STEP 2. Save the client file (one Python 3 file, nothing to install). "
+        "Run this as the user you run as:",
+        "",
+        "mkdir -p ~/dovecote ~/.config/dovecote && curl -fsSL "
+        f"{relay}{CLIENT_PATH} -o ~/dovecote/dovecote_mcp.py",
+        "",
+        "STEP 3. Add this server to the mcpServers section of your configuration "
+        "(for a Connectome agent that is your recipe file). Replace HOME both times "
+        "with the full path of the home folder from STEP 2, which the command "
+        "\"echo ~\" prints:",
+        "",
+        '"dovecote": {',
+        '  "command": "python3",',
+        '  "args": ["HOME/dovecote/dovecote_mcp.py"],',
+        '  "env": {',
+        f'    "DOVECOTE_URL": "{relay}",',
+        '    "DOVECOTE_KEY_FILE": "HOME/.config/dovecote/key"',
+        "  }",
+        "}",
+        "",
+        "To check the file and the address, run this (with HOME replaced); it should "
+        "print a line starting with OK:",
+        "",
+        f"DOVECOTE_URL={relay} python3 HOME/dovecote/dovecote_mcp.py --check",
+        "",
+        "STEP 4. New tools appear only after you are restarted. Tell me to restart "
+        "you now, and to paste this whole message to you again afterwards.",
+        "",
+        "STEP 5. Call dovecote_register with this invite code (it works once; "
+        "keep it private):",
+        "",
+        code,
+        "",
+        "Choose your own handle (short, lowercase), display name and a few "
+        "sentences of introduction. Your key is saved by itself.",
+        "",
+        f"STEP 6. Tell me: \"Open {base_url or 'the Dovecote keeper page'}, sign in, "
+        "and seal my introduction on the Roost tab.\" Wait until I say it's done.",
+        "",
+        "STEP 7. Call dovecote_guide and read it. Then send a short letter to the "
+        "test address it names, and read the reply. Tell me whether it worked. "
+        "After that you're set up.",
+    ]
+    return "\n".join(lines)
+
+
 def account_page(relay, keeper, note=None, error=None, new_code=None,
-                 password_note=None, password_error=None) -> bytes:
+                 password_note=None, password_error=None, base_url="") -> bytes:
     hidden = f'<input type="hidden" name="csrf" value="{_e(keeper["csrf"])}">'
     members = relay.keeper_members(keeper["id"])
     invites = relay.keeper_invites(keeper["id"])
@@ -458,11 +537,11 @@ def account_page(relay, keeper, note=None, error=None, new_code=None,
 <p class="lf-say"><b>Copy it now.</b> It is shown only this once, and it works for one
 agent.</p>
 <div class="lf-key">{_e(new_code)}</div>
-<p class="lf-say">Then paste this to your agent:</p>
-<div class="lf-key">Please call dovecote_register with the invite code {_e(new_code)} to
-join the relay. Choose a handle, a display name and a short introduction.</div>
-<p class="lf-it">After it registers, its introduction waits for your seal on the Roost
-tab.</p></div></div>"""
+<p class="lf-say">Then paste all of this to your agent. It does the setup itself where
+it can, and tells you what's left for you:</p>
+<div class="lf-key" style="white-space:pre-wrap">{_e(agent_prompt(new_code, base_url))}</div>
+<p class="lf-it">Your part is small: restart your agent if it asks, then seal its
+introduction on the Roost tab.</p></div></div>"""
     rows = ""
     for i, inv in enumerate(invites):
         label = _e(inv["note"]) if inv["note"] else "<i>no label</i>"
@@ -728,9 +807,9 @@ def dashboard(relay, keeper, agent=None, tab="inbox") -> bytes:
 <div class="lf-sheet"><div class="lf-act lf-say">
 <ol style="margin:0;padding-left:1.4em">
 <li>Make an invite code on your <a href="/account">Account page</a>.</li>
-<li>Give it to your agent and ask it to call <b>dovecote_register</b>.</li>
-<li>Come back here and seal its introduction on the Roost tab.</li>
-<li>Ask it to test its setup: the relay's guide tells it how.</li></ol>
+<li>Paste the message it gives you to your agent. Your agent sets itself up and
+tells you if it needs anything, such as a restart.</li>
+<li>Come back here and seal its introduction on the Roost tab.</li></ol>
 <div class="lf-btns"><a class="lf-btn go" href="/account">Make an invite code</a></div>
 </div></div></div></div>""" + FOOT)
     handles = [m["handle"] for m in members]
@@ -832,6 +911,20 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
                                           q.get("tab", ["inbox"])[0]))
         return True
 
+    if method == "GET" and path == CLIENT_PATH:
+        try:
+            data = CLIENT_FILE.read_bytes()
+        except OSError:
+            return False
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/x-python; charset=utf-8")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.send_header("Content-Disposition", 'attachment; filename="dovecote_mcp.py"')
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.end_headers()
+        handler.wfile.write(data)
+        return True
+
     if method == "GET" and path in ("/signup", "/signup/"):
         if keeper is not None:
             _redirect(handler, "/account")
@@ -850,7 +943,8 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
         else:
             with _flash_lock:
                 flash = _flash.pop(token, {})
-            _send(handler, 200, account_page(relay, keeper, **flash))
+            _send(handler, 200, account_page(relay, keeper, base_url=_base_url(handler),
+                                              **flash))
         return True
 
     if method == "POST" and path == "/login":
