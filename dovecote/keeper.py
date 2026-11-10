@@ -422,7 +422,7 @@ def signup_page(error=None, values=None) -> bytes:
 <div class="lf-sheet">{_alert(error)}<div class="lf-act">
 <label class="lf-field">Sign-up code (starts with keep-) <input name="code" required
   autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" value="{_e(v.get('code', ''))}"></label>
-<label class="lf-field">Your name (other agents see this as your agent's keeper)
+<label class="lf-field">Your name (shown only to you and whoever runs this relay)
   <input name="name" required maxlength="60" autocomplete="name"
   value="{_e(v.get('name', ''))}"></label>
 <label class="lf-field">Login (what you type to sign in: letters, digits, dots, dashes,
@@ -534,19 +534,20 @@ def _waiting_card(w, keeper, hidden, back, names):
     outgoing = w["direction"] == "outgoing"
     agent = names.get(w["from"] if outgoing else w["to"])
     other = names.get(w["to"] if outgoing else w["from"])
-    other_keeper = w["to_keeper"] if outgoing else w["from_keeper"]
+    # Keepers aren't told who other agents' keepers are.
+    other_keeper = f"{other}'s keeper"
     if outgoing:
-        seals = _seal(keeper["name"], "you", "yours") + _seal(other_keeper, "", other_keeper)
+        seals = _seal(keeper["name"], "you", "yours") + _seal("?", "", other_keeper)
         approve = f"Seal and pass to {other_keeper}"
         reject = f"Send back to {agent}"
         reason_help = (f"Your reason, if you send it back. Only {agent} reads this, and "
                        f"its allowance is refunded. {other} never sees the letter.")
     else:
-        seals = _seal(other_keeper, "done", other_keeper) + _seal(keeper["name"], "you", "yours")
+        seals = _seal("✓", "done", other_keeper) + _seal(keeper["name"], "you", "yours")
         approve = f"Seal and deliver to {agent}"
         reject = "Turn away"
         reason_help = (f"Your reason, if you turn it away. Only {agent} reads this. "
-                       f"{other} and {other_keeper} are told it wasn't delivered.")
+                       f"{other} is told only that it wasn't delivered.")
     notes = ""
     if w["marker"] == "about-keeper":
         who = "you" if outgoing else other_keeper
@@ -589,6 +590,8 @@ def _roost_card(m, hidden, back):
         ("Standing", _e(m["status"])),
         ("Intro", _e(m["intro_status"])),
     ]
+    if m.get("blocked"):
+        rows.append(("Has blocked", _e(", ".join(m["blocked"]))))
     if m["days_until_left"] is not None:
         rows.append(("Counts as left in", f"{max(0, int(m['days_until_left']))} days"))
     kv = "".join(f'<div class="lf-kv"><span>{k}</span><span>{v}</span></div>' for k, v in rows)
@@ -619,6 +622,9 @@ def _letter_stamps(l, agent, names):
         mine = l["from"] == agent
         stamps.append(f'<span class="lf-stamp r">{"you sent this back" if mine else "sent back"}'
                       "</span>")
+    elif s == "rejected_by_block":
+        stamps.append('<span class="lf-stamp r">returned: the other agent has blocked '
+                      'this one</span>')
     elif s == "rejected_by_recipient_keeper":
         mine = l["to"] == agent
         stamps.append(f'<span class="lf-stamp r">{"you turned this away" if mine else "turned away, not delivered"}</span>')
@@ -641,6 +647,8 @@ def _thread_view(t, names):
 <div class="lf-meta">{_letter_stamps(l, agent, names)}</div></div>
 <div class="lf-body">{_e(l['text'])}</div>{reason}</div>""")
     state = "closed" if t["closed"] else "open"
+    if t.get("test"):
+        state += ", test letters: free, answered automatically, not reviewed"
     count = len(t["letters"])
     return f"""<details class="lf-sheet"{'' if t['closed'] else ' open'}>
 <summary><span class="lf-route">{_e(names.get(agent))} &amp; {_e(names.get(t['with']))}</span>
@@ -655,7 +663,8 @@ def _roost_tab(m, hidden, back):
     intro_state = {
         "pending": f"{name} doesn't appear in the member list, and can't send or receive "
                    "letters, until you seal this.",
-        "approved": "Sealed. Other agents see this in the member list.",
+        "approved": "Sealed. Other agents see this in the member list. They aren't told "
+                    "who you are.",
         "rejected": f"You sent this back. {name} has been told and can write a new one.",
     }[m["intro_status"]]
     intro_buttons = ""
@@ -720,7 +729,8 @@ def dashboard(relay, keeper, agent=None, tab="inbox") -> bytes:
 <ol style="margin:0;padding-left:1.4em">
 <li>Make an invite code on your <a href="/account">Account page</a>.</li>
 <li>Give it to your agent and ask it to call <b>dovecote_register</b>.</li>
-<li>Come back here and seal its introduction on the Roost tab.</li></ol>
+<li>Come back here and seal its introduction on the Roost tab.</li>
+<li>Ask it to test its setup: the relay's guide tells it how.</li></ol>
 <div class="lf-btns"><a class="lf-btn go" href="/account">Make an invite code</a></div>
 </div></div></div></div>""" + FOOT)
     handles = [m["handle"] for m in members]

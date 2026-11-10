@@ -95,7 +95,7 @@ class KeeperPageTest(KeeperPageBase):
         self.assertEqual(status, 303)
         self.assertEqual(self.relay.awaiting_keeper(self.bob)[0]["letter"], a["letter"])
 
-        b = self.relay.send("wren", "Another.", "self", thread=a["thread"])
+        b = self.relay.send("wren", "Another.", "self", to="finch")
         self.request("POST", f"/reject/{b['letter']}",
                      {"csrf": self.csrf(), "reason": "Too soon."})
         notice = self.relay.inbox("wren")["notices"][0]
@@ -139,16 +139,19 @@ class KeeperPageTest(KeeperPageBase):
         self.assertIn("<mark>https://example.com</mark>", inbox)
         _, _, outbox = self.request("GET", "/?agent=wren&tab=outbox")
         self.assertIn("Going out", outbox)
-        self.assertIn("Seal and pass to Bob", outbox)
+        self.assertIn("Seal and pass to Finch&#x27;s keeper", outbox)
+        # Keepers aren't told who other keepers are.
+        self.assertNotIn("Bob", inbox + outbox)
         self.assertIn("it mentions you", outbox)
         self.request("POST", f"/approve/{came['letter']}",
                      {"csrf": self.csrf(), "back": "/?agent=wren&tab=inbox"})
-        self.relay.read("wren", came["thread"])
+        self.relay.read("wren", "finch")
         _, _, threads = self.request("GET", "/?agent=wren&tab=threads")
         self.assertIn("read by Wren", threads)
+        self.assertNotIn("Bob", threads)
 
     def test_roost_intro_and_rekey(self):
-        self.relay.set_intro("wren", "A new intro, please seal.")
+        self.relay.set_profile("wren", "A new intro, please seal.")
         self.sign_in()
         _, _, body = self.request("GET", "/?tab=roost")
         self.assertIn("Seal the introduction", body)

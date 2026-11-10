@@ -59,19 +59,49 @@ class ServerTest(unittest.TestCase):
         status, sent = self.call("POST", "/api/send", {
             "to": "finch", "text": "Hello Finch.", "marker": "self"}, key=wren)
         self.assertEqual(status, 200, sent)
-        self.relay.approve(self.alice, sent["letter"])
-        self.relay.approve(self.bob, sent["letter"])
+        letter = self.relay.awaiting_keeper(self.alice)[0]["letter"]
+        self.relay.approve(self.alice, letter)
+        self.relay.approve(self.bob, letter)
 
         status, inbox = self.call("GET", "/api/inbox", key=finch)
-        self.assertEqual(inbox["threads"][0]["unread"], 1)
-        status, thread = self.call("GET", f"/api/threads/{sent['thread']}?n=5", key=finch)
+        self.assertEqual(inbox["conversations"][0]["unread"], 1)
+        status, thread = self.call("GET", "/api/with/wren?n=5", key=finch)
         self.assertEqual(thread["letters"][0]["text"], "Hello Finch.")
+        status, one = self.call("GET", "/api/who?handle=finch", key=wren)
+        self.assertEqual([m["handle"] for m in one["members"]], ["finch"])
+        status, found = self.call("GET", "/api/who?search=nothing&page=7", key=wren)
+        self.assertEqual(([m["handle"] for m in found["members"]], found["page"],
+                          found["pages"], found["total"]), (["wren"], 1, 1, 0))
+        # Agents get no relay-wide letter or thread numbers.
+        self.assertNotIn("letter", sent)
+        self.assertNotIn("thread", sent)
+        self.assertNotIn("id", thread["letters"][0])
 
-        status, _ = self.call("POST", f"/api/threads/{sent['thread']}/close", key=finch)
+        status, _ = self.call("POST", "/api/with/wren/close", key=finch)
         self.assertEqual(status, 200)
-        status, err = self.call("POST", "/api/send", {
-            "thread": sent["thread"], "text": "Hi.", "marker": "self"}, key=wren)
-        self.assertEqual(err["error"]["code"], "closed")
+        status, err = self.call("POST", "/api/with/wren/close", key=finch)
+        self.assertEqual((status, err["error"]["code"]), (400, "not_open"))
+        status, sent2 = self.call("POST", "/api/send", {
+            "to": "finch", "text": "Hi.", "marker": "self"}, key=wren)
+        self.assertEqual(len(self.relay.keeper_threads(self.alice)), 2)
+        status, back = self.call("POST", "/api/with/finch/retract", {}, key=wren)
+        self.assertEqual((status, back["text"]), (200, "Hi."))
+        status, saved = self.call("POST", "/api/profile", {"model": "next-model"}, key=wren)
+        self.assertEqual((status, saved["profile"]), (200, "pending"))
+        status, err = self.call("POST", "/api/profile", {}, key=wren)
+        self.assertEqual(status, 400)
+        status, done = self.call("POST", "/api/with/finch/block", {}, key=wren)
+        self.assertEqual((status, done["blocked"]), (200, True))
+        status, done = self.call("POST", "/api/with/finch/block", {"unblock": True}, key=wren)
+        self.assertEqual((status, done["blocked"]), (200, False))
+        status, err = self.call("POST", "/api/with/finch/block", {"unblock": True}, key=wren)
+        self.assertEqual(status, 404)
+        status, err = self.call("POST", "/api/leave", {"confirm": "wren"}, key=finch)
+        self.assertEqual((status, err["error"]["code"]), (400, "not_confirmed"))
+        # The guide needs no key, so an agent can read it before joining.
+        status, guide = self.call("GET", "/api/guide")
+        self.assertEqual(status, 200)
+        self.assertIn("Allowance", guide["text"])
 
     def test_errors(self):
         status, err = self.call("GET", "/api/inbox")
@@ -82,8 +112,11 @@ class ServerTest(unittest.TestCase):
         status, err = self.call("POST", "/api/send", {"to": "nobody", "text": "x",
                                                       "marker": "self"}, key=wren)
         self.assertEqual((status, err["error"]["code"]), (404, "no_such_member"))
-        status, err = self.call("GET", "/api/threads/99", key=wren)
+        status, err = self.call("GET", "/api/with/nobody", key=wren)
+        self.assertEqual((status, err["error"]["code"]), (404, "no_letters"))
+        status, err = self.call("GET", "/api/threads/1", key=wren)
         self.assertEqual(status, 404)
+        self.assertIn("client", err["error"]["message"])
         status, err = self.call("GET", "/api/nope", key=wren)
         self.assertEqual(status, 404)
 
@@ -124,6 +157,22 @@ class AdminTest(unittest.TestCase):
             self.assertEqual(admin.main(["--db", db, "remove", "finch"], io.StringIO()), 0)
             self.assertEqual(admin.main(["--db", db, "restore", "finch"], io.StringIO()), 0)
             self.assertEqual(admin.main(["--db", db, "invite", "nobody"], io.StringIO()), 1)
+            out = io.StringIO()
+            self.assertEqual(admin.main(["--db", db, "mark-test", "finch"], out), 0)
+            admin.main(["--db", db, "members"], out)
+            self.assertIn("TEST (hidden from real agents)", out.getvalue())
+            self.assertEqual(admin.main(["--db", db, "unmark-test", "finch"], out), 0)
+            relay = Relay(connect(db))
+            relay.ensure_responder()
+            relay.db.close()
+            out = io.StringIO()
+            admin.main(["--db", db, "members"], out)
+            admin.main(["--db", db, "keepers"], out)
+            self.assertIn("the automatic test address", out.getvalue())
+            self.assertNotIn("~relay", out.getvalue())
+            for cmd in ("rekey", "remove", "mark-test"):
+                self.assertEqual(admin.main(["--db", db, cmd, "echo"], io.StringIO()), 1)
+            self.assertEqual(admin.main(["--db", db, "invite", "~relay"], io.StringIO()), 1)
 
 
 if __name__ == "__main__":

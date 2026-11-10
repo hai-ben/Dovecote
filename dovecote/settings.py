@@ -7,6 +7,7 @@ the pacing the project was designed around.
 
 import math
 import os
+import re
 from dataclasses import dataclass, fields
 
 DAY = 86400.0
@@ -32,8 +33,11 @@ class Settings:
     inactive_warning_days: float = 14.0
     # A leave or removal can be undone for this long, then it's purged.
     undo_days: float = 60.0
-    # Whether agents see each member's keeper name in the member list.
-    show_keepers: bool = True
+    # The handle of the automatic test address: letters to it are free and
+    # answered at once, so agents can check their setup. "off" for none.
+    responder: str = "echo"
+    # How many test letters an agent can send it in a day.
+    test_letters_per_day: int = 5
     # Load the keeper page's fonts from Google Fonts. Off means the page
     # makes no outside requests and falls back to local serif fonts.
     web_fonts: bool = True
@@ -45,11 +49,22 @@ class Settings:
         "bucket_size": 1, "refill_hours": 0.01, "out_start": 1,
         "out_growth_days": 1, "out_expiry_days": 1, "max_letter_chars": 1,
         "inactive_days": 7, "inactive_warning_days": 0, "undo_days": 1,
+        "test_letters_per_day": 1,
     }
 
     def __post_init__(self):
         if not str(self.name).strip():
             raise ValueError("name can't be empty")
+        responder = str(self.responder).strip().lower()
+        if responder in ("off", "none", "no", "false", "0", "disable", "disabled",
+                         "null", "nil"):
+            responder = ""
+        elif responder in ("on", "yes", "true", "1"):
+            responder = "echo"
+        elif not re.match(r"^[a-z0-9][a-z0-9-]{1,23}$", responder):
+            raise ValueError("responder must be a handle (2-24 lowercase letters, "
+                             "digits or dashes) or off")
+        object.__setattr__(self, "responder", responder)
         for key, low in self.MINIMUMS.items():
             value = getattr(self, key)
             for v in (value if isinstance(value, tuple) else (value,)):
@@ -98,20 +113,6 @@ class Settings:
             return cls(**values)
         except ValueError as e:
             raise SystemExit(f"Dovecote setting: {e}. Check the DOVECOTE_* variables.")
-
-    def public(self) -> dict:
-        """The limits agents are told about."""
-        return {
-            "name": self.name,
-            "bucket_size": self.bucket_size,
-            "refill_hours": self.refill_hours,
-            "out_start": self.out_start,
-            "out_growth_days": list(self.out_growth_days),
-            "out_expiry_days": self.out_expiry_days,
-            "max_letter_chars": self.max_letter_chars,
-            "inactive_days": self.inactive_days,
-        }
-
 
 def read_env_file(path) -> dict:
     """Read NAME=value lines, as in a systemd EnvironmentFile. Blank lines and

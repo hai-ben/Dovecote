@@ -11,6 +11,8 @@
     python3 -m dovecote.admin --db PATH rekey finch
     python3 -m dovecote.admin --db PATH remove finch
     python3 -m dovecote.admin --db PATH restore finch
+    python3 -m dovecote.admin --db PATH mark-test finch
+    python3 -m dovecote.admin --db PATH unmark-test finch
     python3 -m dovecote.admin --db PATH sweep
 """
 
@@ -19,7 +21,7 @@ import getpass
 import sys
 import time
 
-from .core import DovecoteError, Relay
+from .core import SYSTEM_LOGIN, DovecoteError, Relay
 from .db import connect
 from .settings import Settings
 
@@ -55,6 +57,11 @@ def main(argv=None, out=sys.stdout):
     r.add_argument("handle")
     s = sub.add_parser("restore", help="Undo a removal or leave.")
     s.add_argument("handle")
+    mt = sub.add_parser("mark-test", help="Mark an agent as a test agent: real agents "
+                                          "don't see it in the member list.")
+    mt.add_argument("handle")
+    ut = sub.add_parser("unmark-test", help="Make a test agent an ordinary agent again.")
+    ut.add_argument("handle")
     sub.add_parser("sweep", help="Mark inactive agents as left and purge old leaves.")
     args = p.parse_args(argv)
 
@@ -90,7 +97,8 @@ def main(argv=None, out=sys.stdout):
             rows = relay.db.execute(
                 """SELECT k.login, k.name, k.created_at,
                           (SELECT count(*) FROM members m WHERE m.keeper_id = k.id) AS agents
-                   FROM keepers k ORDER BY k.created_at""").fetchall()
+                   FROM keepers k WHERE k.login != ? ORDER BY k.created_at""",
+                (SYSTEM_LOGIN,)).fetchall()
             for k in rows:
                 made = time.strftime("%Y-%m-%d", time.gmtime(k["created_at"]))
                 print(f"{k['login']:<16} {k['name']:<20} agents={k['agents']} "
@@ -115,13 +123,18 @@ def main(argv=None, out=sys.stdout):
             print(f"Invite code for {args.login}'s agent (works once):\n{code}", file=out)
         elif args.cmd == "members":
             rows = relay.db.execute(
-                """SELECT m.handle, m.status, m.model, k.login, m.last_seen_at
+                """SELECT m.handle, m.status, m.kind, m.model, k.login, m.last_seen_at
                    FROM members m JOIN keepers k ON k.id = m.keeper_id
                    ORDER BY m.joined_at""").fetchall()
             for m in rows:
+                if m["kind"] == "responder":
+                    print(f"{m['handle']:<16} {m['status']:<8} the automatic test "
+                          "address", file=out)
+                    continue
                 seen = time.strftime("%Y-%m-%d", time.gmtime(m["last_seen_at"]))
+                test = " TEST (hidden from real agents)" if m["kind"] == "test" else ""
                 print(f"{m['handle']:<16} {m['status']:<8} keeper={m['login']:<12} "
-                      f"model={m['model']} last_seen={seen}", file=out)
+                      f"model={m['model']} last_seen={seen}{test}", file=out)
             if not rows:
                 print("No members yet.", file=out)
         elif args.cmd == "rekey":
@@ -135,6 +148,14 @@ def main(argv=None, out=sys.stdout):
         elif args.cmd == "restore":
             relay.restore(args.handle)
             print(f"Restored {args.handle}.", file=out)
+        elif args.cmd == "mark-test":
+            relay.set_test(args.handle, True)
+            print(f"{args.handle} is now a test agent. Real agents don't see it in the "
+                  "member list and can't start writing to it. It still sees everyone.",
+                  file=out)
+        elif args.cmd == "unmark-test":
+            relay.set_test(args.handle, False)
+            print(f"{args.handle} is an ordinary agent again.", file=out)
         elif args.cmd == "sweep":
             print(relay.sweep(), file=out)
     except DovecoteError as e:
