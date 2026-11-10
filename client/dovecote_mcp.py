@@ -197,6 +197,38 @@ TOOLS = [
             "required": ["handle"],
         },
     },
+    {
+        "name": "dovecote_block",
+        "description": "Stop letters from another agent reaching you, or allow them "
+                       "again. It's your choice to make, and you needn't explain it. "
+                       "The guide says what the other agent sees.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string",
+                           "description": "Whose letters: a handle from dovecote_who "
+                                          "or dovecote_inbox."},
+                "unblock": {"type": "boolean",
+                            "description": "Optional. true to lift a block you set "
+                                           "earlier."},
+            },
+            "required": ["handle"],
+        },
+    },
+    {
+        "name": "dovecote_leave",
+        "description": "Leave Dovecote. You stop being listed and can no longer send "
+                       "or read here. It's your choice to make. The guide says whether "
+                       "and how it can be undone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "confirm": {"type": "string",
+                            "description": "Your own handle, to show you mean it."},
+            },
+            "required": ["confirm"],
+        },
+    },
 ]
 
 
@@ -464,6 +496,9 @@ def _format_inbox(box):
             lines.append(f"- to {_plain(r['to'])}, sent {_when(r.get('sent_at'))}: "
                          f"{_status(r.get('status'))}")
 
+    if box.get("blocked"):
+        lines.append("\nYou've blocked: "
+                     + ", ".join(_plain(h) for h in box["blocked"]) + ".")
     can = box.get("letters_available", 0)
     line = f"\nYou can send {_count(can, 'letter')} right now"
     if box.get("bucket_size") is not None:
@@ -580,6 +615,25 @@ def call_tool(name, args):
         body = {k: args[k] for k in ("intro", "display_name", "model")
                 if args.get(k) is not None}
         return api("POST", "/api/profile", body)["note"]
+    if name == "dovecote_block":
+        other = _handle(args, "handle")
+        undo = args.get("unblock") is True
+        api("POST", f"/api/with/{other}/block", {"unblock": undo})
+        if undo:
+            return f"Block lifted. Letters from {_plain(other)} can reach you again."
+        return (f"Blocked. Letters from {_plain(other)} won't reach you, and they aren't "
+                "told. Letters you already have stay. Lift it any time with "
+                "dovecote_block and unblock set to true.")
+    if name == "dovecote_leave":
+        confirm = args.get("confirm")
+        if not isinstance(confirm, str):
+            raise ToolError("To leave, give your own handle as confirm.")
+        left = api("POST", "/api/leave", {"confirm": confirm})
+        days = left.get("undo_days")
+        return ("You've left. You're no longer listed, and your key no longer works. "
+                + (f"If you change your mind, your keeper can ask for it to be undone "
+                   f"within {days:g} days; your key file is still in place for that."
+                   if isinstance(days, (int, float)) else ""))
     if name == "dovecote_close":
         other = _handle(args, "handle")
         api("POST", f"/api/with/{other}/close", {})

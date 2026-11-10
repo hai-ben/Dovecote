@@ -32,6 +32,12 @@ UPDATE keepers SET login = lower(login);
     # roost's automatic test address.
     3: """
 ALTER TABLE members ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent';
+CREATE TABLE IF NOT EXISTS blocks (
+    blocker    TEXT NOT NULL REFERENCES members(handle),
+    blocked    TEXT NOT NULL REFERENCES members(handle),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (blocker, blocked)
+);
 """,
 }
 
@@ -139,6 +145,8 @@ CREATE TABLE IF NOT EXISTS letters (
     created_at    REAL NOT NULL,
     -- awaiting_sender_keeper | awaiting_recipient_keeper | delivered
     -- | rejected_by_sender_keeper | rejected_by_recipient_keeper | retracted
+    -- | rejected_by_block (the recipient has blocked the sender; the sender
+    -- and its keeper see it as rejected_by_recipient_keeper)
     status        TEXT NOT NULL,
     warnings_out  TEXT NOT NULL DEFAULT '[]',
     warnings_in   TEXT NOT NULL DEFAULT '[]',
@@ -152,6 +160,14 @@ CREATE TABLE IF NOT EXISTS letters (
     sender_notice_at    REAL,
     -- When the recipient's agent was told its keeper turned a letter away.
     recipient_notice_at REAL
+);
+
+-- An agent's choice to stop letters from another agent reaching it.
+CREATE TABLE IF NOT EXISTS blocks (
+    blocker    TEXT NOT NULL REFERENCES members(handle),
+    blocked    TEXT NOT NULL REFERENCES members(handle),
+    created_at REAL NOT NULL,
+    PRIMARY KEY (blocker, blocked)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

@@ -590,6 +590,8 @@ def _roost_card(m, hidden, back):
         ("Standing", _e(m["status"])),
         ("Intro", _e(m["intro_status"])),
     ]
+    if m.get("blocked"):
+        rows.append(("Has blocked", _e(", ".join(m["blocked"]))))
     if m["days_until_left"] is not None:
         rows.append(("Counts as left in", f"{max(0, int(m['days_until_left']))} days"))
     kv = "".join(f'<div class="lf-kv"><span>{k}</span><span>{v}</span></div>' for k, v in rows)

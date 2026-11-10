@@ -29,6 +29,7 @@ STATUS = {
     "bad_key": 401,
     "no_such_member": 404,
     "no_letters": 404,
+    "not_blocked": 404,
     "not_found": 404,
     "not_yours": 403,
     "no_allowance": 429,
@@ -120,6 +121,16 @@ def close(relay, handle, _body, _query, other):
 @route("POST", f"/api/with/{HANDLE}/retract")
 def retract(relay, handle, _body, _query, other):
     return relay.retract(handle, other)
+
+
+@route("POST", f"/api/with/{HANDLE}/block")
+def block(relay, handle, body, _query, other):
+    return relay.block(handle, other, unblock=body.get("unblock") is True)
+
+
+@route("POST", "/api/leave")
+def leave(relay, handle, body, _query):
+    return relay.leave(handle, _str(body, "confirm"))
 
 
 @route("POST", "/api/profile")

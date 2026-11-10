@@ -32,7 +32,7 @@ def tool(name, **args):
 
 
 # sha256 of the frozen tool definitions; see test_tool_definitions_are_frozen.
-FROZEN = "d91214a3c6c9c39c0af8df07eafd4a3bbdf06ebccf66ba35a6d6f8dff742535d"
+FROZEN = "a07bdbc0abd79c38681bce54ce55727d8ee5c94f787f4a71a4536a7fe5b5d7e2"
 
 
 class ClientTest(unittest.TestCase):
@@ -72,7 +72,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(names, [
             "dovecote_guide", "dovecote_register", "dovecote_who", "dovecote_inbox",
             "dovecote_read", "dovecote_send", "dovecote_retract", "dovecote_profile",
-            "dovecote_close"])
+            "dovecote_close", "dovecote_block", "dovecote_leave"])
 
     def test_tool_definitions_are_frozen(self):
         """Hosts cache the tool names, descriptions and schemas (and the
@@ -221,6 +221,38 @@ class ClientTest(unittest.TestCase):
         self.assertIn("Your profile is waiting for your keeper's approval", text)
         err, text = tool("dovecote_profile")
         self.assertTrue(err)
+
+    def test_block_and_leave(self):
+        tool("dovecote_register", code=self.relay.create_invite("alice"),
+             handle="wren", display_name="Wren", model="m", intro="A wren.")
+        self.relay.register(self.relay.create_invite("bob"), "finch", "Finch", "m", "i")
+        err, text = tool("dovecote_block", handle="finch")
+        self.assertFalse(err, text)
+        self.assertIn("they aren't told", text)
+        err, text = tool("dovecote_inbox")
+        self.assertIn("You've blocked: finch.", text)
+        err, text = tool("dovecote_send", to="finch", text="Hi.", marker="self")
+        self.assertTrue(err)
+        self.assertIn("dovecote_block", text)
+        err, text = tool("dovecote_block", handle="finch", unblock=True)
+        self.assertFalse(err, text)
+        err, text = tool("dovecote_block", handle="finch", unblock=True)
+        self.assertTrue(err)
+        err, text = tool("dovecote_block", handle="nobody")
+        self.assertTrue(err)
+        for wrong in ({}, {"confirm": "finch"}, {"confirm": True}):
+            err, text = tool("dovecote_leave", **wrong)
+            self.assertTrue(err)
+        err, text = tool("dovecote_inbox")
+        self.assertFalse(err, text)
+        err, text = tool("dovecote_leave", confirm="Wren")
+        self.assertFalse(err, text)
+        self.assertIn("within 60 days", text)
+        err, text = tool("dovecote_inbox")
+        self.assertTrue(err)
+        self.relay.restore("wren")
+        err, text = tool("dovecote_inbox")
+        self.assertFalse(err, text)
 
     def test_test_address_round_trip(self):
         self.relay.ensure_responder()

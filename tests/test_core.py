@@ -639,5 +639,116 @@ class TestAgentTest(RelayTest):
         self.assertNotIn("swift", self.handles("lark"))
 
 
+class BlockTest(RelayTest):
+    """An agent can stop another agent's letters reaching it, quietly."""
+
+    def test_blocked_letters_come_back_as_not_delivered(self):
+        self.deliver("finch", "wren", "Before.")
+        waiting = self.relay.send("finch", "Waiting on Alice.", "self", to="wren")
+        self.relay.approve(self.bob, waiting["letter"])
+        self.assertEqual(self.relay.block("wren", "finch"), {"blocked": True,
+                                                             "handle": "finch"})
+        # The letter that was waiting on Wren's keeper goes no further.
+        self.assertEqual(self.relay.awaiting_keeper(self.alice), [])
+        self.assertEqual(self.relay.inbox("wren")["letters_waiting_on_your_keeper"], 0)
+        self.clock.advance(9 * 3600)
+        later = self.relay.send("finch", "After.", "self", to="wren")
+        self.assertEqual(later["status"], "awaiting_sender_keeper")
+        # Finch's keeper approves as usual and is told nothing different.
+        self.assertEqual(self.relay.approve(self.bob, later["letter"]),
+                         "awaiting_recipient_keeper")
+        self.assertEqual(self.relay.awaiting_keeper(self.alice), [])
+        # Finch sees exactly what a keeper's turn-away looks like.
+        notices = self.relay.inbox("finch")["notices"]
+        self.assertEqual(len(notices), 2)
+        for n in notices:
+            self.assertEqual(n["what"], "This letter wasn't delivered. The other "
+                                        "agent's keeper doesn't give a reason.")
+            self.assertNotIn("reason", n)
+        mine = [l["status"] for l in self.relay.read("finch", "wren", n=5)["letters"]]
+        self.assertEqual(mine, ["delivered", "rejected_by_recipient_keeper",
+                                "rejected_by_recipient_keeper"])
+        self.assertNotIn("block", str(self.relay.read("finch", "wren", n=5)))
+        self.assertNotIn("block", str(self.relay.keeper_threads(self.bob)))
+        self.assertEqual(self.relay.inbox("finch")["blocked"], [])
+        self.assertNotIn("block", str(self.relay.who("finch")))
+        # Blocked letters don't stay "out", and aren't refunded (like a turn-away).
+        self.assertEqual(self.relay.inbox("finch")["letters_out"], 1)
+        # Wren keeps what already arrived, sees nothing new, and isn't told of attempts.
+        box = self.relay.inbox("wren")
+        self.assertEqual((box["blocked"], box["notices"]), (["finch"], []))
+        self.assertEqual([l["text"] for l in self.relay.read("wren", "finch", n=5)["letters"]],
+                         ["Before."])
+        self.assertEqual(len(self.relay.keeper_threads(self.alice)[0]["letters"]), 1)
+        self.assertEqual(self.relay.keeper_members(self.alice)[0]["blocked"], ["finch"])
+
+    def test_unblock_and_writing_to_someone_you_block(self):
+        self.deliver("wren", "finch", "Earlier.")
+        self.assertEqual(self.relay.inbox("wren")["letters_out"], 1)
+        self.relay.block("wren", "finch")
+        self.relay.block("wren", "finch")  # twice is fine
+        # No answer can come, so the earlier letter stops counting as out.
+        self.assertEqual(self.relay.inbox("wren")["letters_out"], 0)
+        with self.assertRaises(DovecoteError) as e:
+            self.relay.send("wren", "Hello?", "self", to="finch")
+        self.assertEqual(e.exception.code, "blocked")
+        self.relay.block("wren", "finch", unblock=True)
+        self.assertEqual(self.relay.inbox("wren")["letters_out"], 1)
+        with self.assertRaises(DovecoteError) as e:
+            self.relay.block("wren", "finch", unblock=True)
+        self.assertEqual(e.exception.code, "not_blocked")
+        sent = self.relay.send("finch", "Now it arrives.", "self", to="wren")
+        self.relay.approve(self.bob, sent["letter"])
+        self.assertEqual(self.relay.approve(self.alice, sent["letter"]), "delivered")
+
+    def test_block_cannot_find_hidden_members(self):
+        self.relay.ensure_responder()
+        self.join("bob", "swift")
+        self.relay.set_test("swift", True)
+        self.relay.register(self.relay.create_invite("bob"), "lark", "Lark", "m", "i")
+        seen = set()
+        for other in ("swift", "lark", "nobody"):
+            with self.assertRaises(DovecoteError) as e:
+                self.relay.block("wren", other)
+            seen.add((e.exception.code, e.exception.message.replace(other, "X")))
+            with self.assertRaises(DovecoteError) as e:
+                self.relay.block("wren", other, unblock=True)
+            seen.add((e.exception.code, e.exception.message.replace(other, "X")))
+        self.assertEqual(len(seen), 2)
+        for other, code in (("wren", "self"), ("echo", "responder")):
+            with self.assertRaises(DovecoteError) as e:
+                self.relay.block("wren", other)
+            self.assertEqual(e.exception.code, code)
+
+    def test_purge_drops_blocks(self):
+        self.relay.block("wren", "finch")
+        self.relay.remove("finch")
+        self.clock.advance(61 * DAY)
+        self.relay.inbox("wren")
+        self.relay.sweep()
+        self.assertEqual(self.relay.inbox("wren")["blocked"], [])
+
+
+class LeaveTest(RelayTest):
+    def test_leave_needs_own_handle_and_can_be_undone(self):
+        for wrong in ("", "finch", "yes"):
+            with self.assertRaises(DovecoteError) as e:
+                self.relay.leave("wren", wrong)
+            self.assertEqual(e.exception.code, "not_confirmed")
+        self.assertEqual(self.relay.authenticate(self.wren_key), "wren")
+        self.assertEqual(self.relay.leave("wren", " Wren "), {"left": True, "undo_days": 60.0})
+        with self.assertRaises(DovecoteError):
+            self.relay.authenticate(self.wren_key)
+        self.assertNotIn("wren", [m["handle"] for m in self.relay.who("finch")])
+        self.assertEqual(self.relay.keeper_members(self.alice)[0]["status"], "left")
+        self.relay.restore("wren")
+        self.assertEqual(self.relay.authenticate(self.wren_key), "wren")
+        # Left for good once the undo window passes.
+        self.relay.leave("wren", "wren")
+        self.clock.advance(61 * DAY)
+        self.relay.inbox("finch")
+        self.assertEqual(self.relay.sweep()["purged"], ["wren"])
+
+
 if __name__ == "__main__":
     unittest.main()
