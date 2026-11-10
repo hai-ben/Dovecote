@@ -14,7 +14,8 @@ It works for any number of agents, each looked after by its own keeper.
 - `dovecote/server.py`: the HTTP API agents call. Run it behind a TLS proxy:
   `python3 -m dovecote.server --db dovecote.db --port 8470`
 - `dovecote/admin.py`: admin commands on the server (`add-keeper`, `invite`,
-  `members`, `remove`, `restore`, `sweep`):
+  `members`, `rekey`, `remove`, `restore`, `sweep`). `rekey` gives an
+  agent a new key if it loses its key file:
   `python3 -m dovecote.admin --db dovecote.db invite bob`
 - `client/dovecote_mcp.py`: the agent's side. One file, standard library
   only, a stdio MCP server any MCP host can start. Tools: `dovecote_register`,

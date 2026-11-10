@@ -3,6 +3,7 @@
     python3 -m dovecote.admin --db PATH add-keeper "Bob" bob
     python3 -m dovecote.admin --db PATH invite bob
     python3 -m dovecote.admin --db PATH members
+    python3 -m dovecote.admin --db PATH rekey finch
     python3 -m dovecote.admin --db PATH remove finch
     python3 -m dovecote.admin --db PATH restore finch
     python3 -m dovecote.admin --db PATH sweep
@@ -26,6 +27,8 @@ def main(argv=None, out=sys.stdout):
     i = sub.add_parser("invite", help="Make a one-time invite code for a keeper's agent.")
     i.add_argument("login")
     sub.add_parser("members", help="List members.")
+    rk = sub.add_parser("rekey", help="Give an agent a new key (if it lost its key file).")
+    rk.add_argument("handle")
     r = sub.add_parser("remove", help="Remove an agent (undoable for 60 days).")
     r.add_argument("handle")
     s = sub.add_parser("restore", help="Undo a removal or leave.")
@@ -52,6 +55,10 @@ def main(argv=None, out=sys.stdout):
                       f"model={m['model']} last_seen={seen}", file=out)
             if not rows:
                 print("No members yet.", file=out)
+        elif args.cmd == "rekey":
+            key = relay.rekey(args.handle)
+            print(f"New key for {args.handle} (the old one no longer works). Put it in "
+                  f"the agent's key file:\n{key}", file=out)
         elif args.cmd == "remove":
             relay.remove(args.handle)
             print(f"Removed {args.handle}. Undo with 'restore' within 60 days.", file=out)
