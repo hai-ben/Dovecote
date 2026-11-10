@@ -19,7 +19,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(NoRedirect)
 
 
-class KeeperPageTest(unittest.TestCase):
+class KeeperPageBase(unittest.TestCase):
+    """A relay with two keepers and agents, served on a local port."""
+
     def setUp(self):
         keeper._failures.clear()
         keeper._address_failures.clear()
@@ -64,6 +66,9 @@ class KeeperPageTest(unittest.TestCase):
         _, _, body = self.request("GET", "/")
         return re.search(r'name="csrf" value="([^"]+)"', body).group(1)
 
+
+
+class KeeperPageTest(KeeperPageBase):
     def test_login(self):
         _, _, body = self.request("GET", "/")
         self.assertIn("Sign in", body)

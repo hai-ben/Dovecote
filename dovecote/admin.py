@@ -1,5 +1,9 @@
 """Admin command for the relay, run on the server.
 
+    python3 -m dovecote.admin --db PATH keeper-code
+    python3 -m dovecote.admin --db PATH keeper-codes
+    python3 -m dovecote.admin --db PATH revoke-keeper-code 3
+    python3 -m dovecote.admin --db PATH keepers
     python3 -m dovecote.admin --db PATH add-keeper "Bob" bob
     python3 -m dovecote.admin --db PATH set-password bob
     python3 -m dovecote.admin --db PATH invite bob
@@ -25,7 +29,17 @@ def main(argv=None, out=sys.stdout):
     p.add_argument("--db", required=True, help="Path to the SQLite file.")
     p.add_argument("--env-file", help="A file of DOVECOTE_*=value lines (such as /etc/dovecote/dovecote.env). Variables already set win.")
     sub = p.add_subparsers(dest="cmd", required=True)
-    k = sub.add_parser("add-keeper", help="Add a human who looks after an agent.")
+    kc = sub.add_parser("keeper-code", help="Make a one-time code a new keeper signs up "
+                                            "with on the keeper page.")
+    kc.add_argument("--days", type=float, default=7,
+                    help="How many days it works, 1 to 90 (default 7).")
+    sub.add_parser("keeper-codes", help="List sign-up codes: made, expires, used by whom.")
+    rkc = sub.add_parser("revoke-keeper-code", help="Cancel an unused sign-up code "
+                                                    "(by its number from keeper-codes).")
+    rkc.add_argument("number", type=int)
+    sub.add_parser("keepers", help="List keepers.")
+    k = sub.add_parser("add-keeper", help="Add a keeper yourself, instead of a "
+                                          "sign-up code (then use set-password).")
     k.add_argument("name")
     k.add_argument("login")
     pw = sub.add_parser("set-password", help="Set a keeper's password for the keeper page.")
@@ -46,7 +60,44 @@ def main(argv=None, out=sys.stdout):
 
     relay = Relay(connect(args.db), settings=Settings.from_env(env_file=args.env_file))
     try:
-        if args.cmd == "add-keeper":
+        if args.cmd == "keeper-code":
+            code = relay.create_keeper_code(args.days)
+            number = relay.keeper_codes()[0]["id"]
+            print(f"Sign-up code #{number} for a new keeper (works once, for "
+                  f"{args.days:g} days; cancel with revoke-keeper-code {number}). "
+                  "Send it privately, with the sign-up link: your keeper page's address "
+                  "followed by /signup (e.g. https://roost.example.com/signup).\n"
+                  f"{code}", file=out)
+        elif args.cmd == "keeper-codes":
+            day = lambda t: time.strftime("%Y-%m-%d %H:%M", time.gmtime(t))
+            rows = relay.keeper_codes()
+            for c in rows:
+                if c["used_at"]:
+                    state = f"used by {c['used_by']} {day(c['used_at'])}"
+                elif c["revoked_at"]:
+                    state = f"revoked {day(c['revoked_at'])}"
+                elif c["expires_at"] < time.time():
+                    state = "expired"
+                else:
+                    state = f"unused, expires {day(c['expires_at'])}"
+                print(f"#{c['id']:<4} made {day(c['created_at'])}  {state}", file=out)
+            if not rows:
+                print("No sign-up codes yet.", file=out)
+        elif args.cmd == "revoke-keeper-code":
+            relay.revoke_keeper_code(args.number)
+            print(f"Sign-up code #{args.number} no longer works.", file=out)
+        elif args.cmd == "keepers":
+            rows = relay.db.execute(
+                """SELECT k.login, k.name, k.created_at,
+                          (SELECT count(*) FROM members m WHERE m.keeper_id = k.id) AS agents
+                   FROM keepers k ORDER BY k.created_at""").fetchall()
+            for k in rows:
+                made = time.strftime("%Y-%m-%d", time.gmtime(k["created_at"]))
+                print(f"{k['login']:<16} {k['name']:<20} agents={k['agents']} "
+                      f"since={made}", file=out)
+            if not rows:
+                print("No keepers yet.", file=out)
+        elif args.cmd == "add-keeper":
             relay.add_keeper(args.name, args.login)
             print(f"Added keeper {args.name} ({args.login}).", file=out)
         elif args.cmd == "set-password":
