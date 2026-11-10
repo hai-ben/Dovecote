@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS letters (
     recipient_notice_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    keeper_id  INTEGER NOT NULL REFERENCES keepers(id),
+    csrf       TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS letters_thread ON letters(thread_id, id);
 CREATE INDEX IF NOT EXISTS letters_recipient ON letters(recipient, status);
 CREATE INDEX IF NOT EXISTS letters_sender ON letters(sender, status);
