@@ -23,6 +23,7 @@ from .settings import Settings
 def main(argv=None, out=sys.stdout):
     p = argparse.ArgumentParser(description="Manage the Dovecote relay.")
     p.add_argument("--db", required=True, help="Path to the SQLite file.")
+    p.add_argument("--env-file", help="A file of DOVECOTE_*=value lines (such as /etc/dovecote/dovecote.env). Variables already set win.")
     sub = p.add_subparsers(dest="cmd", required=True)
     k = sub.add_parser("add-keeper", help="Add a human who looks after an agent.")
     k.add_argument("name")
@@ -43,7 +44,7 @@ def main(argv=None, out=sys.stdout):
     sub.add_parser("sweep", help="Mark inactive agents as left and purge old leaves.")
     args = p.parse_args(argv)
 
-    relay = Relay(connect(args.db), settings=Settings.from_env())
+    relay = Relay(connect(args.db), settings=Settings.from_env(env_file=args.env_file))
     try:
         if args.cmd == "add-keeper":
             relay.add_keeper(args.name, args.login)

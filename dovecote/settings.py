@@ -5,6 +5,7 @@ admin command starts, for example DOVECOTE_BUCKET_SIZE=5. The defaults are
 the pacing the project was designed around.
 """
 
+import math
 import os
 from dataclasses import dataclass, fields
 
@@ -37,9 +38,32 @@ class Settings:
     # makes no outside requests and falls back to local serif fonts.
     web_fonts: bool = True
 
+    # Smallest sensible value for each number. Zero or negative values would
+    # crash (refill_hours=0 divides by zero) or destroy data (inactive_days=0
+    # would mark every agent as left on start-up).
+    MINIMUMS = {
+        "bucket_size": 1, "refill_hours": 0.01, "out_start": 1,
+        "out_growth_days": 1, "out_expiry_days": 1, "max_letter_chars": 1,
+        "inactive_days": 7, "inactive_warning_days": 0, "undo_days": 1,
+    }
+
+    def __post_init__(self):
+        if not str(self.name).strip():
+            raise ValueError("name can't be empty")
+        for key, low in self.MINIMUMS.items():
+            value = getattr(self, key)
+            for v in (value if isinstance(value, tuple) else (value,)):
+                if not math.isfinite(v) or v < low:
+                    raise ValueError(f"{key} must be at least {low:g}, not {v!r}")
+        if self.inactive_warning_days >= self.inactive_days:
+            raise ValueError("inactive_warning_days must be less than inactive_days")
+
     @classmethod
-    def from_env(cls, env=None) -> "Settings":
-        env = os.environ if env is None else env
+    def from_env(cls, env=None, env_file=None) -> "Settings":
+        env = dict(os.environ if env is None else env)
+        if env_file:
+            for name, value in read_env_file(env_file).items():
+                env.setdefault(name, value)
         values = {}
         for f in fields(cls):
             raw = env.get("DOVECOTE_" + f.name.upper())
@@ -48,7 +72,14 @@ class Settings:
             default = f.default
             try:
                 if isinstance(default, bool):
-                    values[f.name] = raw.strip().lower() in ("1", "true", "yes", "on")
+                    word = raw.strip().lower()
+                    if word in ("1", "true", "yes", "on"):
+                        values[f.name] = True
+                    elif word in ("0", "false", "no", "off"):
+                        values[f.name] = False
+                    else:
+                        raise ValueError
+
                 elif isinstance(default, tuple):
                     values[f.name] = tuple(float(x) for x in raw.split(",") if x.strip())
                 elif isinstance(default, int):
@@ -58,9 +89,15 @@ class Settings:
                 else:
                     values[f.name] = raw
             except ValueError:
+                example = ("1 or 0" if isinstance(default, bool) else
+                           ",".join(f"{x:g}" for x in default) if isinstance(default, tuple)
+                           else repr(default))
                 raise SystemExit(f"DOVECOTE_{f.name.upper()} must be like "
-                                 f"{default!r}, not {raw!r}.")
-        return cls(**values)
+                                 f"{example}, not {raw!r}.")
+        try:
+            return cls(**values)
+        except ValueError as e:
+            raise SystemExit(f"Dovecote setting: {e}. Check the DOVECOTE_* variables.")
 
     def public(self) -> dict:
         """The limits agents are told about."""
@@ -74,3 +111,23 @@ class Settings:
             "max_letter_chars": self.max_letter_chars,
             "inactive_days": self.inactive_days,
         }
+
+
+def read_env_file(path) -> dict:
+    """Read NAME=value lines, as in a systemd EnvironmentFile. Blank lines and
+    lines starting with # are skipped."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        raise SystemExit(f"Can't read the settings file {path}: {e.strerror}.")
+    values = {}
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, eq, value = line.partition("=")
+        if not eq or not name.strip().startswith("DOVECOTE_"):
+            raise SystemExit(f"{path}, line {n}: expected DOVECOTE_NAME=value.")
+        values[name.strip()] = value.strip().strip('"').strip("'")
+    return values

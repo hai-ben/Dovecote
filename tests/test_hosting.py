@@ -1,5 +1,7 @@
 import importlib.util
 import os
+import subprocess
+import time
 import sqlite3
 import tempfile
 import threading
@@ -42,6 +44,31 @@ class SettingsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             Settings.from_env({"DOVECOTE_BUCKET_SIZE": "lots"})
 
+    def test_bad_values_refused(self):
+        for name, raw in (("REFILL_HOURS", "0"), ("INACTIVE_DAYS", "0"),
+                          ("BUCKET_SIZE", "-1"), ("MAX_LETTER_CHARS", "0"),
+                          ("REFILL_HOURS", "nan"), ("UNDO_DAYS", "inf"),
+                          ("OUT_GROWTH_DAYS", "14,0"), ("SHOW_KEEPERS", "maybe"),
+                          ("INACTIVE_WARNING_DAYS", "200"), ("NAME", " ")):
+            with self.subTest(name=name, raw=raw), self.assertRaises(SystemExit):
+                Settings.from_env({"DOVECOTE_" + name: raw})
+
+    def test_env_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "dovecote.env")
+            Path(path).write_text("# comment\n\nDOVECOTE_INACTIVE_DAYS=365\n"
+                                  "DOVECOTE_NAME=The Loft\n")
+            s = Settings.from_env({}, env_file=path)
+            self.assertEqual((s.inactive_days, s.name), (365.0, "The Loft"))
+            # A variable that's already set wins over the file.
+            s = Settings.from_env({"DOVECOTE_NAME": "Attic"}, env_file=path)
+            self.assertEqual(s.name, "Attic")
+            Path(path).write_text("INACTIVE_DAYS=365\n")
+            with self.assertRaises(SystemExit):
+                Settings.from_env({}, env_file=path)
+            with self.assertRaises(SystemExit):
+                Settings.from_env({}, env_file=os.path.join(d, "missing.env"))
+
     def test_relay_uses_settings(self):
         relay = relay_with(Settings(bucket_size=5, max_letter_chars=20, show_keepers=False))
         inbox = relay.inbox("wren")
@@ -80,8 +107,45 @@ class ClientUrlTest(unittest.TestCase):
             self.assertIn("unencrypted", str(e.exception))
             self.assertFalse(mcp._insecure_url("http://127.0.0.1:8470"))
             self.assertFalse(mcp._insecure_url("https://relay.example.com"))
+            self.assertTrue(mcp._insecure_url("HTTP://relay.example.com"))
+            mcp.URL = "ftp://relay.example.com"
+            with self.assertRaises(mcp.ToolError):
+                mcp.api("GET", "/api/who", auth=False)
         finally:
             mcp.URL = old
+
+    def test_who_without_keeper_names(self):
+        relay = relay_with(Settings(show_keepers=False))
+        text = mcp._format_who({"you": "wren", "members": relay.who("wren")})
+        self.assertIn("finch", text)
+        self.assertNotIn("keeper", text.split("(Name")[0])
+        relay.db.close()
+
+
+class BackupTest(unittest.TestCase):
+    def run_backup(self, db, dest):
+        return subprocess.run(["sh", str(ROOT / "deploy" / "backup.sh"), db, dest, "2"],
+                              capture_output=True, text=True)
+
+    def test_backup(self):
+        with tempfile.TemporaryDirectory() as d:
+            db, dest = os.path.join(d, "dovecote.db"), os.path.join(d, "backups")
+            connect(db).close()
+            for _ in range(3):
+                self.assertEqual(self.run_backup(db, dest).returncode, 0)
+            files = sorted(os.listdir(dest))
+            self.assertEqual(len(files), 2)  # kept 2, all names unique
+            self.assertFalse([f for f in files if f.endswith(".partial")])
+            # A mistyped path fails, creates nothing, and keeps the backups.
+            r = self.run_backup(os.path.join(d, "dovecot.db"), dest)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertFalse(os.path.exists(os.path.join(d, "dovecot.db")))
+            self.assertEqual(sorted(os.listdir(dest)), files)
+            # So does a file that isn't a Dovecote database.
+            other = os.path.join(d, "other.db")
+            sqlite3.connect(other).close()
+            self.assertNotEqual(self.run_backup(other, dest).returncode, 0)
+            self.assertEqual(sorted(os.listdir(dest)), files)
 
 
 class KeeperHostingTest(unittest.TestCase):
@@ -113,6 +177,16 @@ class KeeperHostingTest(unittest.TestCase):
         self.assertNotIn("--insecure-cookies", body)
         _, body = self.get(host="roost.example.com")
         self.assertIn("--insecure-cookies", body)
+
+    def test_flooding_cannot_clear_a_lock(self):
+        now = time.time()
+        locked = ("203.0.113.9", "alice")
+        keeper._failures[locked] = [now] * keeper.MAX_FAILURES
+        for i in range(keeper.MAX_TRACKED + 200):
+            key = ("203.0.113.9", f"made-up-{i}")
+            keeper._note_failure(key, [now], now)
+        self.assertIn(locked, keeper._failures)
+        self.assertLessEqual(len(keeper._failures), keeper.MAX_TRACKED)
 
     def test_lockout_is_per_address(self):
         for _ in range(keeper.MAX_FAILURES):

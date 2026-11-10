@@ -6,14 +6,16 @@ After=network.target
 
 [Service]
 Type=simple
-# A dedicated user with no login shell: useradd --system --home /var/lib/dovecote dovecote
+# A dedicated user with no login shell:
+#   useradd --system --home /var/lib/dovecote --shell /usr/sbin/nologin dovecote
 User=dovecote
 Group=dovecote
 WorkingDirectory=/opt/dovecote
-ExecStart=/usr/bin/python3 -m dovecote.server --db /var/lib/dovecote/dovecote.db --host 127.0.0.1 --port 8470 --behind-proxy
-# Optional settings (see README, "Settings"):
-# Environment=DOVECOTE_NAME=Dovecote
-# Environment=DOVECOTE_WEB_FONTS=0
+ExecStart=/usr/bin/python3 -m dovecote.server --db /var/lib/dovecote/dovecote.db --host 127.0.0.1 --port 8470 --behind-proxy \
+    --env-file /etc/dovecote/dovecote.env
+# Settings (see README, "Settings") live in /etc/dovecote/dovecote.env (copy
+# deploy/dovecote.env there). Give the admin command the same --env-file so
+# both follow the same rules.
 StateDirectory=dovecote
 Restart=on-failure
 NoNewPrivileges=true

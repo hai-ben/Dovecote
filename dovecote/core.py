@@ -15,11 +15,6 @@ from typing import Callable
 from .settings import DAY, Settings
 
 
-# Defaults; a host changes them through Settings (see settings.py).
-_D = Settings()
-BUCKET_SIZE = _D.bucket_size
-MAX_LETTER_CHARS = _D.max_letter_chars
-
 MARKERS = ("self", "about-keeper")
 HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,23}$")
 

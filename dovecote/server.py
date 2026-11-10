@@ -9,6 +9,7 @@ Standard library only; run it behind a TLS proxy such as Caddy.
 import argparse
 import json
 import re
+import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -205,22 +206,33 @@ def main(argv=None):
     p.add_argument("--db", required=True, help="Path to the SQLite file.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8470)
+    p.add_argument("--env-file", help="A file of DOVECOTE_*=value lines (such as /etc/dovecote/dovecote.env). Variables already set win.")
     p.add_argument("--insecure-cookies", action="store_true",
                    help="Allow keeper sign-in over plain HTTP (local testing only). "
                         "Without it, the keeper page only works over HTTPS or on "
                         "localhost in some browsers.")
     p.add_argument("--behind-proxy", action="store_true",
                    help="Trust the X-Forwarded-For header from a local proxy such as "
-                        "Caddy or nginx (used for sign-in rate limits).")
+                        "Caddy or nginx (used for sign-in rate limits). Only use it when the port is reachable "
+                        "from the proxy alone, never on a directly exposed port.")
     args = p.parse_args(argv)
-    relay = Relay(connect(args.db), check_out=filters.check_out,
-                  check_in=filters.check_in, settings=Settings.from_env())
-    relay.sweep()
+    settings = Settings.from_env(env_file=args.env_file)
+    try:
+        relay = Relay(connect(args.db), check_out=filters.check_out,
+                      check_in=filters.check_in, settings=settings)
+        relay.sweep()
+    except sqlite3.Error as e:
+        raise SystemExit(f"Can't use the database at {args.db}: {e}. Check that the "
+                         "file and its folder are writable by this user.")
+    try:
+        server = make_server(relay, args.host, args.port,
+                             secure_cookies=not args.insecure_cookies,
+                             behind_proxy=args.behind_proxy)
+    except OSError as e:
+        raise SystemExit(f"Can't listen on {args.host}:{args.port}: {e.strerror}. "
+                         "Is another relay already running there?")
     stop = threading.Event()
     threading.Thread(target=_sweeper, args=(relay, stop), daemon=True).start()
-    server = make_server(relay, args.host, args.port,
-                         secure_cookies=not args.insecure_cookies,
-                         behind_proxy=args.behind_proxy)
     print(f"Dovecote relay on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
