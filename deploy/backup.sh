@@ -25,13 +25,16 @@ trap 'rm -f "$TMP"' EXIT
 # and only keep the copy if SQLite says it's sound.
 python3 - "$DB" "$TMP" <<'PY'
 import pathlib, sqlite3, sys
-src = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
-dst = sqlite3.connect(sys.argv[2])
-src.backup(dst)
-src.close()
-result = dst.execute("PRAGMA integrity_check").fetchone()[0]
-tables = dst.execute("SELECT count(*) FROM sqlite_master WHERE name = 'members'").fetchone()[0]
-dst.close()
+try:
+    src = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
+    dst = sqlite3.connect(sys.argv[2])
+    src.backup(dst)
+    src.close()
+    result = dst.execute("PRAGMA integrity_check").fetchone()[0]
+    tables = dst.execute("SELECT count(*) FROM sqlite_master WHERE name = 'members'").fetchone()[0]
+    dst.close()
+except sqlite3.Error as e:
+    sys.exit(f"Couldn't back up {sys.argv[1]}: {e}. Is it a Dovecote database?")
 if result != "ok" or not tables:
     sys.exit(f"The copy failed its check ({result}, members table: {bool(tables)}).")
 PY

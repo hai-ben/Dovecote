@@ -151,6 +151,7 @@ class BackupTest(unittest.TestCase):
 class KeeperHostingTest(unittest.TestCase):
     def setUp(self):
         keeper._failures.clear()
+        keeper._address_failures.clear()
         self.relay = relay_with(Settings(name="The Loft", web_fonts=False))
         self.relay.set_password("alice", "correct horse battery")
         self.server = make_server(self.relay, "127.0.0.1", 0, quiet=True)
@@ -180,13 +181,37 @@ class KeeperHostingTest(unittest.TestCase):
 
     def test_flooding_cannot_clear_a_lock(self):
         now = time.time()
-        locked = ("203.0.113.9", "alice")
+        locked, nearly = ("203.0.113.9", "alice"), ("203.0.113.9", "bob")
         keeper._failures[locked] = [now] * keeper.MAX_FAILURES
+        keeper._failures[nearly] = [now] * (keeper.MAX_FAILURES - 1)
         for i in range(keeper.MAX_TRACKED + 200):
-            key = ("203.0.113.9", f"made-up-{i}")
-            keeper._note_failure(key, [now], now)
+            keeper._note_failure(keeper._failures, ("198.51.100.1", f"made-up-{i}"),
+                                 now, keeper.MAX_FAILURES)
         self.assertIn(locked, keeper._failures)
+        # Entries with the most failures go last, so a nearly locked count survives.
+        self.assertEqual(len(keeper._failures[nearly]), keeper.MAX_FAILURES - 1)
         self.assertLessEqual(len(keeper._failures), keeper.MAX_TRACKED)
+
+    def test_many_logins_lock_the_address(self):
+        data = lambda login: urllib.parse.urlencode(
+            {"login": login, "password": "wrong"}).encode()
+        codes = []
+        for i in range(keeper.MAX_ADDRESS_FAILURES + 1):
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    self.base + "/login", data=data(f"made-up-{i}")))
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+        self.assertEqual(codes[:keeper.MAX_ADDRESS_FAILURES],
+                         [401] * keeper.MAX_ADDRESS_FAILURES)
+        self.assertEqual(codes[-1], 429)
+        # Even the right password waits until the lockout ends.
+        try:
+            urllib.request.urlopen(urllib.request.Request(self.base + "/login", data=
+                urllib.parse.urlencode({"login": "alice",
+                                        "password": "correct horse battery"}).encode()))
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 429)
 
     def test_lockout_is_per_address(self):
         for _ in range(keeper.MAX_FAILURES):

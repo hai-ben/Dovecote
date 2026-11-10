@@ -22,6 +22,7 @@ OPENER = urllib.request.build_opener(NoRedirect)
 class KeeperPageTest(unittest.TestCase):
     def setUp(self):
         keeper._failures.clear()
+        keeper._address_failures.clear()
         self.relay = Relay(connect(":memory:"))
         self.alice = self.relay.add_keeper("Alice", "alice")
         self.bob = self.relay.add_keeper("Bob", "bob")
