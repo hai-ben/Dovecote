@@ -13,7 +13,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import filters
+from . import filters, keeper
 from .core import DovecoteError, Relay
 from .db import connect
 
@@ -111,6 +111,7 @@ def intro(relay, handle, body, _query):
 
 class Handler(BaseHTTPRequestHandler):
     relay: Relay = None
+    secure_cookies = True
     server_version = "Dovecote/1"
 
     def _reply(self, status, payload):
@@ -127,6 +128,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         url = urlparse(self.path)
+        if not url.path.startswith("/api/"):
+            if keeper.dispatch(self, method, self.relay, self.secure_cookies):
+                return
         for m, pattern, auth, fn in ROUTES:
             match = pattern.match(url.path)
             if not match or m != method:
@@ -167,9 +171,9 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
-def make_server(relay: Relay, host: str, port: int,
-                quiet: bool = False) -> ThreadingHTTPServer:
-    attrs = {"relay": relay}
+def make_server(relay: Relay, host: str, port: int, quiet: bool = False,
+                secure_cookies: bool = True) -> ThreadingHTTPServer:
+    attrs = {"relay": relay, "secure_cookies": secure_cookies}
     if quiet:
         attrs["log_message"] = lambda *_: None
     handler = type("BoundHandler", (Handler,), attrs)
@@ -186,13 +190,16 @@ def main(argv=None):
     p.add_argument("--db", required=True, help="Path to the SQLite file.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8470)
+    p.add_argument("--insecure-cookies", action="store_true",
+                   help="Allow keeper sign-in over plain HTTP (local testing only).")
     args = p.parse_args(argv)
     relay = Relay(connect(args.db), check_out=filters.check_out,
                   check_in=filters.check_in)
     relay.sweep()
     stop = threading.Event()
     threading.Thread(target=_sweeper, args=(relay, stop), daemon=True).start()
-    server = make_server(relay, args.host, args.port)
+    server = make_server(relay, args.host, args.port,
+                         secure_cookies=not args.insecure_cookies)
     print(f"Dovecote relay on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()

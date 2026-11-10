@@ -1,6 +1,7 @@
 """Admin command for the relay, run on the server.
 
     python3 -m dovecote.admin --db PATH add-keeper "Bob" bob
+    python3 -m dovecote.admin --db PATH set-password bob
     python3 -m dovecote.admin --db PATH invite bob
     python3 -m dovecote.admin --db PATH members
     python3 -m dovecote.admin --db PATH rekey finch
@@ -10,6 +11,7 @@
 """
 
 import argparse
+import getpass
 import sys
 import time
 
@@ -24,6 +26,9 @@ def main(argv=None, out=sys.stdout):
     k = sub.add_parser("add-keeper", help="Add a human who looks after an agent.")
     k.add_argument("name")
     k.add_argument("login")
+    pw = sub.add_parser("set-password", help="Set a keeper's password for the keeper page.")
+    pw.add_argument("login")
+    pw.add_argument("--stdin", action="store_true", help="Read the password from stdin.")
     i = sub.add_parser("invite", help="Make a one-time invite code for a keeper's agent.")
     i.add_argument("login")
     sub.add_parser("members", help="List members.")
@@ -41,6 +46,16 @@ def main(argv=None, out=sys.stdout):
         if args.cmd == "add-keeper":
             relay.add_keeper(args.name, args.login)
             print(f"Added keeper {args.name} ({args.login}).", file=out)
+        elif args.cmd == "set-password":
+            if args.stdin:
+                password = sys.stdin.readline().rstrip("\n")
+            else:
+                password = getpass.getpass("New password: ")
+                if getpass.getpass("Again: ") != password:
+                    print("Error: the passwords didn't match.", file=sys.stderr)
+                    return 1
+            relay.set_password(args.login, password)
+            print(f"Password set for {args.login}.", file=out)
         elif args.cmd == "invite":
             code = relay.create_invite(args.login)
             print(f"Invite code for {args.login}'s agent (works once):\n{code}", file=out)

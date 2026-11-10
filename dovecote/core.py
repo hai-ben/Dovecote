@@ -56,6 +56,26 @@ def _hash(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()
 
 
+PASSWORD_ITERATIONS = 600_000
+SESSION_SECONDS = 7 * DAY
+
+
+def hash_password(password: str, salt: bytes = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+
+def check_password(password: str, stored: str) -> bool:
+    try:
+        _, iterations, salt, digest = stored.split("$")
+    except (AttributeError, ValueError):
+        return False
+    test = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt),
+                               int(iterations))
+    return secrets.compare_digest(test.hex(), digest)
+
+
 def _no_warnings(_text: str) -> list:
     return []
 
@@ -179,6 +199,45 @@ class Relay:
         if row is None:
             raise DovecoteError("no_such_keeper", f"No keeper with login {login!r}.")
         return row
+
+    def set_password(self, keeper_login: str, password: str) -> None:
+        if len(password) < 12:
+            raise DovecoteError("weak_password", "Use at least 12 characters.")
+        keeper = self.keeper_by_login(keeper_login)
+        with self._tx():
+            self.db.execute("UPDATE keepers SET password_hash = ? WHERE id = ?",
+                            (hash_password(password), keeper["id"]))
+            # Changing the password signs out every session.
+            self.db.execute("DELETE FROM sessions WHERE keeper_id = ?", (keeper["id"],))
+
+    def login(self, keeper_login: str, password: str):
+        """Return (session token, csrf token), or raise."""
+        row = self._one("SELECT * FROM keepers WHERE login = ?", keeper_login)
+        if row is None or not check_password(password, row["password_hash"]):
+            raise DovecoteError("bad_login", "Wrong login or password.")
+        token = secrets.token_urlsafe(32)
+        csrf = secrets.token_urlsafe(24)
+        now = self.clock()
+        with self._tx():
+            self.db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            self.db.execute(
+                "INSERT INTO sessions (token_hash, keeper_id, csrf, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (_hash(token), row["id"], csrf, now + SESSION_SECONDS))
+        return token, csrf
+
+    def session(self, token: str):
+        """Return the keeper row and csrf token for a session, or None."""
+        if not token:
+            return None
+        s = self._one(
+            """SELECT k.*, s.csrf FROM sessions s JOIN keepers k ON k.id = s.keeper_id
+               WHERE s.token_hash = ? AND s.expires_at > ?""", _hash(token), self.clock())
+        return s
+
+    def logout(self, token: str) -> None:
+        with self._tx():
+            self.db.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash(token),))
 
     def create_invite(self, keeper_login: str) -> str:
         """Make a one-time code. The agent that uses it belongs to this keeper."""
@@ -520,6 +579,16 @@ class Relay:
             raise DovecoteError("not_yours", "That isn't your agent.")
         return m
 
+    def keeper_rekey(self, keeper_id: int, handle: str) -> str:
+        """A keeper cuts a new key for their own agent."""
+        self._own_member(keeper_id, handle)
+        return self.rekey(handle)
+
+    def keeper_name(self, handle: str) -> str:
+        row = self._one("""SELECT k.name FROM members m JOIN keepers k
+                           ON k.id = m.keeper_id WHERE m.handle = ?""", handle)
+        return row["name"] if row else "?"
+
     def approve_intro(self, keeper_id: int, handle: str) -> None:
         with self._tx():
             self._own_member(keeper_id, handle)
@@ -554,6 +623,8 @@ class Relay:
                 "from": r["sender"], "to": r["recipient"], "marker": r["marker"],
                 "text": r["body"], "sent_at": r["created_at"],
                 "warnings": json.loads(r["warnings_out" if outgoing else "warnings_in"]),
+                "from_keeper": self.keeper_name(r["sender"]),
+                "to_keeper": self.keeper_name(r["recipient"]),
             })
         return out
 
@@ -630,6 +701,12 @@ class Relay:
                         "marker": r["marker"], "status": r["status"],
                         "text": r["body"], "sent_at": r["created_at"],
                         "delivered_at": r["delivered_at"],
+                        # A keeper sees the reason only if they wrote it.
+                        "reason": r["reject_reason"] if (
+                            (r["status"] == "rejected_by_sender_keeper"
+                             and r["sender"] == agent)
+                            or (r["status"] == "rejected_by_recipient_keeper"
+                                and r["recipient"] == agent)) else None,
                         # Read state is shown only for letters to the keeper's own
                         # agent (a testing aid, to be turned off later).
                         "read_at": r["read_at"] if r["recipient"] == agent else None})
