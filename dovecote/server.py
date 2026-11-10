@@ -116,7 +116,12 @@ class Handler(BaseHTTPRequestHandler):
             if not match or m != method:
                 continue
             try:
-                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    return self._error(400, "bad_length", "Bad Content-Length header.")
                 if length > MAX_BODY:
                     return self._error(413, "too_large", "Request too large.")
                 body = {}

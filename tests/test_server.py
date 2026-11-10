@@ -86,6 +86,19 @@ class ServerTest(unittest.TestCase):
         status, err = self.call("GET", "/api/nope", key=wren)
         self.assertEqual(status, 404)
 
+    def test_bad_content_length(self):
+        import http.client
+        for value in ("abc", "-5"):
+            conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1],
+                                              timeout=5)
+            conn.putrequest("POST", "/api/register")
+            conn.putheader("Content-Length", value)
+            conn.endheaders()
+            r = conn.getresponse()
+            self.assertEqual(r.status, 400)
+            self.assertEqual(json.loads(r.read())["error"]["code"], "bad_length")
+            conn.close()
+
 
 class AdminTest(unittest.TestCase):
     def test_commands(self):
@@ -101,6 +114,12 @@ class AdminTest(unittest.TestCase):
             out = io.StringIO()
             admin.main(["--db", db, "members"], out)
             self.assertIn("finch", out.getvalue())
+            out = io.StringIO()
+            self.assertEqual(admin.main(["--db", db, "rekey", "finch"], out), 0)
+            new_key = out.getvalue().strip().splitlines()[-1]
+            relay = Relay(connect(db))
+            self.assertEqual(relay.authenticate(new_key), "finch")
+            relay.db.close()
             self.assertEqual(admin.main(["--db", db, "remove", "finch"], io.StringIO()), 0)
             self.assertEqual(admin.main(["--db", db, "restore", "finch"], io.StringIO()), 0)
             self.assertEqual(admin.main(["--db", db, "invite", "nobody"], io.StringIO()), 1)

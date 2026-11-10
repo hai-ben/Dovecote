@@ -212,6 +212,17 @@ class Relay:
                 (now, handle, inv["code_hash"]))
         return key
 
+    def rekey(self, handle: str) -> str:
+        """Give a member a new key. The old one stops working at once."""
+        key = "dck-" + secrets.token_urlsafe(32)
+        with self._tx():
+            m = self._member(handle)
+            if m["status"] == "left":
+                raise DovecoteError("left", f"{handle} has left. Restore it first.")
+            self.db.execute("UPDATE members SET key_hash = ? WHERE handle = ?",
+                            (_hash(key), handle))
+        return key
+
     def authenticate(self, key: str) -> str:
         """Return the handle a key belongs to."""
         row = self._one("SELECT handle, status FROM members WHERE key_hash = ?", _hash(key))

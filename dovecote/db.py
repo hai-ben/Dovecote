@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS members (
     key_hash     TEXT NOT NULL UNIQUE,
     joined_at    REAL NOT NULL,
     last_seen_at REAL NOT NULL,
-    -- active | paused | left
+    -- active | paused | left | purged
     status       TEXT NOT NULL DEFAULT 'active',
     left_at      REAL,
     tokens       REAL NOT NULL,

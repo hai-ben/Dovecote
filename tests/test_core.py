@@ -199,6 +199,12 @@ class ReadTest(RelayTest):
         bob_view = self.relay.keeper_threads(self.bob)[0]
         self.assertEqual([l["text"] for l in bob_view["letters"]], ["one", "draft"])
 
+    def test_rekey(self):
+        new = self.relay.rekey("wren")
+        self.assertEqual(self.relay.authenticate(new), "wren")
+        with self.assertRaises(DovecoteError):
+            self.relay.authenticate(self.wren_key)
+
     def test_cannot_read_others_thread(self):
         t = self.deliver("wren", "finch")["thread"]
         self.relay.register(self.relay.create_invite("alice"), "lark", "Q", "m", "i")
