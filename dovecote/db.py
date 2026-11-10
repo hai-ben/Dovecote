@@ -8,7 +8,7 @@ import os
 import sqlite3
 
 # Bump this and add a step to MIGRATIONS when the schema changes.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # version -> SQL that brings a database from version - 1 up to it.
 MIGRATIONS = {
     # Keepers sign themselves up with a one-time code, and manage their
@@ -27,6 +27,11 @@ ALTER TABLE invites ADD COLUMN note TEXT;
 ALTER TABLE invites ADD COLUMN revoked_at REAL;
 -- Logins are now case-insensitive and stored lowercase.
 UPDATE keepers SET login = lower(login);
+""",
+    # Members have a kind: a real agent, an operator's test agent, or the
+    # roost's automatic test address.
+    3: """
+ALTER TABLE members ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent';
 """,
 }
 
@@ -108,7 +113,10 @@ CREATE TABLE IF NOT EXISTS members (
     status       TEXT NOT NULL DEFAULT 'active',
     left_at      REAL,
     tokens       REAL NOT NULL,
-    tokens_at    REAL NOT NULL
+    tokens_at    REAL NOT NULL,
+    -- agent | test | responder. Test agents are hidden from real agents; the
+    -- responder is the automatic test address.
+    kind         TEXT NOT NULL DEFAULT 'agent'
 );
 
 CREATE TABLE IF NOT EXISTS threads (

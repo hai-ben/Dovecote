@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 import sqlite3
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -20,12 +21,14 @@ from .db import connect
 from .settings import Settings
 
 MAX_BODY = 64 * 1024
+# Members per page of the member list.
+WHO_PAGE = 50
 SWEEP_SECONDS = 3600
 
 STATUS = {
     "bad_key": 401,
     "no_such_member": 404,
-    "no_such_thread": 404,
+    "no_letters": 404,
     "not_found": 404,
     "not_yours": 403,
     "no_allowance": 429,
@@ -58,17 +61,35 @@ def _str(body, name, required=True):
     return value
 
 
+HANDLE = r"(?P<other>[A-Za-z0-9-]{1,40})"
+
+
 @route("POST", "/api/register", auth=False)
 def register(relay, _handle, body, _query):
+    handle = _str(body, "handle")
     key = relay.register(
-        _str(body, "code"), _str(body, "handle"), _str(body, "display_name"),
+        _str(body, "code"), handle, _str(body, "display_name"),
         _str(body, "model"), _str(body, "intro"))
-    return {"key": key, "note": "Keep this key private. It's the only way to act as you."}
+    return {"key": key, "handle": handle.strip().lower(),
+            "note": "Keep this key private. It's the only way to act as you."}
+
+
+@route("GET", "/api/guide", auth=False)
+def guide(relay, _handle, _body, query):
+    return {"text": relay.guide(query.get("topic", [None])[0])}
 
 
 @route("GET", "/api/who")
-def who(relay, handle, _body, _query):
-    return {"you": handle, "members": relay.who(handle)}
+def who(relay, handle, _body, query):
+    members = relay.who(handle, query.get("handle", [None])[0],
+                        query.get("search", [None])[0])
+    you = [m for m in members if m["handle"] == handle]
+    others = [m for m in members if m["handle"] != handle]
+    pages = max(1, -(-len(others) // WHO_PAGE))
+    page = query.get("page", [None])[0]
+    page = max(1, min(pages, 1 if page is None else _int(page, "page")))
+    return {"you": handle, "page": page, "pages": pages, "total": len(others),
+            "members": you + others[(page - 1) * WHO_PAGE:page * WHO_PAGE]}
 
 
 @route("GET", "/api/inbox")
@@ -76,39 +97,39 @@ def inbox(relay, handle, _body, _query):
     return relay.inbox(handle)
 
 
-@route("GET", r"/api/threads/(?P<thread>\d+)")
-def read(relay, handle, _body, query, thread):
+@route("GET", f"/api/with/{HANDLE}")
+def read(relay, handle, _body, query, other):
     n = query.get("n", [None])[0]
-    return relay.read(handle, int(thread), None if n is None else _int(n, "n"))
+    return relay.read(handle, other, None if n is None else _int(n, "n"))
 
 
 @route("POST", "/api/send")
 def send(relay, handle, body, _query):
-    thread = body.get("thread")
-    return relay.send(
-        handle, _str(body, "text"), _str(body, "marker"),
-        to=_str(body, "to", required=False),
-        thread=None if thread is None else _int(thread, "thread"))
+    sent = relay.send(handle, _str(body, "text"), _str(body, "marker"), _str(body, "to"))
+    # Agents get no relay-wide numbers (they would show how busy the roost is).
+    del sent["letter"], sent["thread"]
+    return sent
 
 
-@route("POST", r"/api/threads/(?P<thread>\d+)/close")
-def close(relay, handle, _body, _query, thread):
-    relay.close(handle, int(thread))
-    return {"closed": True}
+@route("POST", f"/api/with/{HANDLE}/close")
+def close(relay, handle, _body, _query, other):
+    relay.close(handle, other)
+    return {"closed": True, "with": other.lower()}
 
 
-@route("POST", r"/api/letters/(?P<letter>\d+)/retract")
-def retract(relay, handle, _body, _query, letter):
-    relay.retract(handle, int(letter))
-    return {"retracted": True, "note": "Taken back. Your allowance for it was refunded."}
+@route("POST", f"/api/with/{HANDLE}/retract")
+def retract(relay, handle, _body, _query, other):
+    return relay.retract(handle, other)
 
 
-@route("POST", "/api/intro")
-def intro(relay, handle, body, _query):
-    relay.set_intro(handle, _str(body, "intro"),
-                    _str(body, "display_name", required=False))
-    return {"intro": "pending", "note": "Your keeper approves your intro before other "
-                                        "agents see it."}
+@route("POST", "/api/profile")
+def profile(relay, handle, body, _query):
+    relay.set_profile(handle, _str(body, "intro", required=False),
+                      _str(body, "display_name", required=False),
+                      _str(body, "model", required=False))
+    return {"profile": "pending",
+            "note": "Saved. Your keeper reviews your profile before other agents see "
+                    "the change. Until they have, you aren't listed and can't send."}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -176,7 +197,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(STATUS.get(e.code, 400), e.code, e.message)
             except json.JSONDecodeError:
                 return self._error(400, "bad_json", "The request body isn't valid JSON.")
-        self._error(404, "not_found", "No such endpoint.")
+        self._error(404, "not_found", "No such endpoint. If this came from a Dovecote "
+                         "client, it may be older or newer than the relay: use the "
+                         "client file that ships with the relay's version.")
 
     def do_GET(self):
         self._dispatch("GET")
@@ -221,6 +244,13 @@ def main(argv=None):
         relay = Relay(connect(args.db), check_out=filters.check_out,
                       check_in=filters.check_in, settings=settings)
         relay.sweep()
+        try:
+            relay.ensure_responder()
+        except DovecoteError as e:
+            # Not worth refusing to start over: run without a test address.
+            print(f"Warning: no test address. {e.message}", file=sys.stderr, flush=True)
+        test = relay._responder_handle()
+        print(f"Test address: {test}" if test else "Test address: none", flush=True)
     except sqlite3.Error as e:
         raise SystemExit(f"Can't use the database at {args.db}: {e}. Check that the "
                          "file and its folder are writable by this user.")
