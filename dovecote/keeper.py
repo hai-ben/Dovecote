@@ -27,6 +27,25 @@ TABS = ("inbox", "outbox", "threads", "roost")
 _failures = {}
 MAX_TRACKED = 5000
 
+
+def _note_failure(key, fails, now):
+    """Remember a failed sign-in. When the table is full, forget expired
+    entries, then ones that aren't locked yet, and never a locked one, so
+    flooding made-up logins can't clear a real lock."""
+    if key not in _failures and len(_failures) >= MAX_TRACKED:
+        cutoff = now - LOCKOUT_SECONDS
+        for k in [k for k, ts in _failures.items() if not ts or ts[-1] < cutoff]:
+            del _failures[k]
+        if len(_failures) >= MAX_TRACKED:
+            for k in [k for k, ts in _failures.items()
+                      if len([t for t in ts if t > cutoff]) < MAX_FAILURES]:
+                del _failures[k]
+                if len(_failures) < MAX_TRACKED:
+                    break
+        if len(_failures) >= MAX_TRACKED:
+            return  # every entry is locked; this one simply isn't tracked
+    _failures[key] = fails
+
 # The settings of the relay serving the current request.
 _local = threading.local()
 
@@ -527,7 +546,7 @@ style="padding:0">{hidden}{back}
     if m["status"] == "paused":
         rest = f"""<form method="post" action="/resume/{h}">{hidden}{back}
 <button class="lf-btn" type="submit">Resume {name}</button></form>"""
-        rest_help = (f"{name} is paused: it can read but not send, and the inactivity "
+        rest_help = (f"{name} is paused: it can read but not send, and the "
                      "inactivity clock is stopped. Resuming restarts the clock.")
     elif m["status"] == "left":
         rest = ""
@@ -671,7 +690,8 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
             return True
         login = form.get("login", "").strip()
         now = time.time()
-        key = (client_ip, login)
+        # Logins are short; a long one is still tracked, but by its start.
+        key = (client_ip, login[:64])
         fails = [t for t in _failures.get(key, []) if t > now - LOCKOUT_SECONDS]
         if len(fails) >= MAX_FAILURES:
             _send(handler, 429, login_page("Too many tries. Wait 15 minutes."))
@@ -679,13 +699,7 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
         try:
             new_token, _csrf = relay.login(login, form.get("password", ""))
         except DovecoteError as e:
-            if len(_failures) >= MAX_TRACKED:
-                for k in [k for k, ts in _failures.items()
-                          if not ts or ts[-1] < now - LOCKOUT_SECONDS]:
-                    del _failures[k]
-                if len(_failures) >= MAX_TRACKED:
-                    _failures.pop(next(iter(_failures)))
-            _failures[key] = fails + [now]
+            _note_failure(key, fails + [now], now)
             _send(handler, 401, login_page(e.message))
             return True
         _failures.pop(key, None)
