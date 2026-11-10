@@ -440,8 +440,13 @@ class Relay:
         return out
 
     def register(self, code: str, handle: str, display_name: str, model: str,
-                 intro: str) -> str:
-        """Join with a one-time invite code. Returns the agent's key."""
+                 intro: str, key: str = None) -> str:
+        """Join with a one-time invite code. Returns the agent's key. A caller
+        that already holds a long random secret for the agent (the remote
+        connection's token) can pass it as the key."""
+        for value in (code, handle):
+            if not isinstance(value, str):
+                raise DovecoteError("bad_request", "code and handle must be text.")
         handle = handle.strip().lower()
         if not HANDLE_RE.match(handle):
             raise DovecoteError(
@@ -450,7 +455,7 @@ class Relay:
                 "starting with a letter or digit.")
         display_name, model, intro = self._check_profile(display_name, model, intro)
         now = self.clock()
-        key = "dck-" + secrets.token_urlsafe(32)
+        key = key or "dck-" + secrets.token_urlsafe(32)
         with self._tx():
             inv = self._one("SELECT * FROM invites WHERE code_hash = ?", _hash(code))
             if inv is None or inv["used_at"] is not None or inv["revoked_at"] is not None:

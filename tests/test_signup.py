@@ -217,32 +217,43 @@ class SignupPageTest(KeeperPageBase):
         status, headers, _ = self.request("POST", "/signup", form)
         self.assertEqual((status, headers["Location"]), (303, "/account"))
         self.cookie = headers["Set-Cookie"].split(";")[0]
+        # A new keeper lands on a first invite, ready to paste to their agent.
         status, _, body = self.request("GET", "/account")
         self.assertIn("Carol", body)
+        first = re.search(r"dove-[\w-]+", body).group(0)
+        base = re.search(r"Relay address: (http://[\w.:]+)", body).group(1)
+        self.assertIn(f"Please read {base}/join.md and follow it", body)
+        self.assertIn("Invite code: " + first, body)
+        self.assertIn(f"&quot;url&quot;: &quot;{base}/mcp&quot;", body)
         csrf = re.search(r'name="csrf" value="([^"]+)"', body).group(1)
-        # Make an invite; it's shown once and works for an agent.
+        # Make another invite; it's shown once and works for an agent.
         status, headers, _ = self.request("POST", "/account/invite",
                                           {"csrf": csrf, "note": "for robin"})
         self.assertEqual((status, headers["Location"]), (303, "/account"))
         _, _, body = self.request("GET", "/account")
         invite = re.search(r"dove-[\w-]+", body).group(0)
+        self.assertNotEqual(invite, first)
         self.assertIn("for robin", body)
         self.assertNotIn("\x00", body)
         # Shown once: a reload of the page no longer shows it, and makes no new code.
         _, _, again = self.request("GET", "/account")
         self.assertNotIn(invite, again)
-        self.assertEqual(len(self.relay.keeper_invites(self.relay.keeper_by_login("carol")["id"])), 1)
-        # The message for the agent carries the code, this relay's address and the
-        # client's address, so the agent can do most of the setup itself.
-        self.assertIn("Call dovecote_register with this invite code", body)
-        base = re.search(r"DOVECOTE_URL=(http://[\w.:]+) ", body).group(1)
-        self.assertIn(base + "/client/dovecote_mcp.py -o", body)
-        self.assertEqual(body.count(invite), 2)  # the code box and the message
-        # The relay hands out its own client file, with no sign-in needed.
+        self.assertEqual(len(self.relay.keeper_invites(self.relay.keeper_by_login("carol")["id"])), 2)
+        # The relay hands out its own client file and the joining steps, with
+        # no sign-in needed. The steps carry this relay's address.
         status, headers, client = self.request("GET", "/client/dovecote_mcp.py")
         self.assertEqual(status, 200)
         self.assertIn("dovecote_register", client)
         self.assertNotIn("text/html", headers["Content-Type"])
+        status, _, steps = self.request("GET", "/join.md")
+        self.assertEqual(status, 200)
+        self.assertIn(f"{base}/mcp", steps)
+        self.assertNotIn("RELAY_URL", steps)
+        # A sign-up link can carry the keeper code, so there is nothing to copy.
+        self.cookie, cookie = None, self.cookie
+        _, _, page = self.request("GET", "/signup?code=keep-abc%22%3E")
+        self.assertIn('value="keep-abc&quot;&gt;"', page)
+        self.cookie = cookie
         self.relay.register(invite, "robin", "Robin", "m", "i")
         _, _, body = self.request("GET", "/account")
         self.assertIn("used by robin", body)

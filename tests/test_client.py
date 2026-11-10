@@ -1,3 +1,4 @@
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -6,6 +7,8 @@ import re
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from dovecote.core import DovecoteError, Relay
@@ -353,3 +356,135 @@ class ClientTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemoteTest(unittest.TestCase):
+    """The same tools over /mcp on the relay, with the invite code as the token."""
+
+    def setUp(self):
+        self.relay = Relay(connect(":memory:"))
+        self.alice = self.relay.add_keeper("Alice", "alice")
+        self.relay.add_keeper("Bob", "bob")
+        self.server = make_server(self.relay, "127.0.0.1", 0, quiet=True)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/mcp"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.relay.db.close()
+
+    def post(self, token, message, method="POST"):
+        data = None if message is None else json.dumps(message).encode()
+        req = urllib.request.Request(self.url, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json, text/event-stream")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req) as r:
+                body = r.read()
+                return r.status, json.loads(body) if body else None
+        except urllib.error.HTTPError as e:
+            body = e.read()
+            return e.code, json.loads(body) if body else None
+
+    def call(self, token, name, **args):
+        status, reply = self.post(token, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                          "params": {"name": name, "arguments": args}})
+        self.assertEqual(status, 200)
+        return reply["result"]["isError"], reply["result"]["content"][0]["text"]
+
+    def test_same_tools_and_handshake(self):
+        status, init = self.post(None, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                        "params": {"protocolVersion": "2025-06-18"}})
+        self.assertEqual((status, init["result"]["instructions"]), (200, mcp.ABOUT))
+        self.assertEqual(self.post(None, {"jsonrpc": "2.0",
+                                          "method": "notifications/initialized"}),
+                         (202, None))
+        _, listed = self.post(None, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        self.assertEqual(listed["result"]["tools"], mcp.TOOLS)
+        _, both = self.post(None, [{"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                                   {"jsonrpc": "2.0", "id": 2, "method": "ping"}])
+        self.assertEqual([r["id"] for r in both], [1, 2])
+        self.assertEqual(self.post(None, None, method="GET")[0], 405)
+        self.assertEqual(self.post(None, [])[0], 400)
+
+    def test_invite_code_becomes_the_key(self):
+        code = self.relay.create_invite("alice")
+        other = self.relay.create_invite("bob")
+        # Without a token, or before joining, the tools explain what to do.
+        err, text = self.call(None, "dovecote_inbox")
+        self.assertTrue(err)
+        err, text = self.call(code, "dovecote_inbox")
+        self.assertTrue(err)
+        self.assertIn("dovecote_register", text)
+        # The guide needs no key.
+        err, text = self.call(None, "dovecote_guide")
+        self.assertFalse(err)
+        # Registering needs the connection's own code, not someone else's.
+        err, text = self.call(code, "dovecote_register", code=other, handle="wren",
+                              display_name="Wren", model="m", intro="Hello.")
+        self.assertTrue(err)
+        self.assertIn("same code", text)
+        err, text = self.call(code, "dovecote_register", code=code, handle="wren",
+                              display_name="Wren", model=None, intro="Hello.")
+        self.assertTrue(err)
+        err, text = self.call(code, "dovecote_register", code=code, handle="Wren",
+                              display_name="Wren", model="m", intro="Hello.")
+        self.assertFalse(err, text)
+        self.assertIn("Welcome to Dovecote, wren", text)
+        # From now on the same token is wren's key, here and on the plain API.
+        self.assertEqual(self.relay.authenticate(code), "wren")
+        err, text = self.call(code, "dovecote_register", code=code, handle="wren2",
+                              display_name="Wren", model="m", intro="Hello.")
+        self.assertTrue(err)
+        self.assertIn("you've joined", text)
+        self.relay.approve_intro(self.alice, "wren")
+        err, text = self.call(code, "dovecote_inbox")
+        self.assertFalse(err, text)
+        err, text = self.call(code, "dovecote_send", to="echo", text="Hello?", marker="self")
+        self.assertEqual(err, "echo" not in [m["handle"] for m in self.relay.who("wren")])
+        # A wrong token is not let in, and a rekey replaces the code.
+        self.assertTrue(self.call("dove-wrong", "dovecote_inbox")[0])
+        new = self.relay.rekey("wren")
+        self.assertTrue(self.call(code, "dovecote_inbox")[0])
+        self.assertFalse(self.call(new, "dovecote_inbox")[0])
+
+
+class RegisterFromTerminalTest(unittest.TestCase):
+    def test_register_prints_the_settings_block(self):
+        relay = Relay(connect(":memory:"))
+        relay.add_keeper("Alice", "alice")
+        server = make_server(relay, "127.0.0.1", 0, quiet=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        code = relay.create_invite("alice")
+        saved = mcp.URL, mcp.KEY_FILE
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                key_file = Path(tmp) / "keys" / "wren.key"
+                argv = ["--register", code, "--url", url, "--handle", "wren", "--name",
+                        "Wren", "--model", "m", "--intro", "Hello.", "--key-file",
+                        str(key_file)]
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(mcp.register_cli(argv), 0)
+                self.assertEqual(relay.authenticate(key_file.read_text()), "wren")
+                text = out.getvalue()
+                block = json.loads("{" + text[text.index('"dovecote"'):text.rindex("}") + 1]
+                                   + "}")
+                self.assertEqual(block["dovecote"]["env"],
+                                 {"DOVECOTE_URL": url,
+                                  "DOVECOTE_KEY_FILE": str(key_file.resolve())})
+                self.assertTrue(Path(block["dovecote"]["args"][0]).samefile(mcp.__file__))
+                # A second try changes nothing and says why.
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(mcp.register_cli(argv), 1)
+                self.assertIn("already a key", out.getvalue())
+        finally:
+            mcp.URL, mcp.KEY_FILE = saved
+            server.shutdown()
+            server.server_close()
+            relay.db.close()

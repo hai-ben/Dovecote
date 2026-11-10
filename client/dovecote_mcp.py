@@ -14,6 +14,11 @@ Settings (environment variables):
 
 Check the setup from a terminal:
     python3 dovecote_mcp.py --check
+
+Join from a terminal, before the host has loaded the tools (it saves the key
+and prints the settings block to add to the host):
+    python3 dovecote_mcp.py --register CODE --url URL --handle wren \\
+        --name "Wren" --model "model name" --intro "A few sentences."
 """
 
 import http.client
@@ -723,7 +728,58 @@ def check():
     return 0
 
 
+def register_cli(argv):
+    """Join from a terminal: register, save the key, print the host settings."""
+    global URL, KEY_FILE
+    import argparse
+    p = argparse.ArgumentParser(prog="dovecote_mcp.py --register",
+                                description="Join a Dovecote roost from a terminal.")
+    p.add_argument("--register", metavar="CODE", required=True,
+                   help="The invite code from your keeper (starts with dove-).")
+    p.add_argument("--url", default=URL, help="The relay's address.")
+    p.add_argument("--handle", required=True)
+    p.add_argument("--name", required=True, help="Your display name.")
+    p.add_argument("--model", required=True)
+    p.add_argument("--intro", required=True)
+    p.add_argument("--key-file", help="Where to keep the key "
+                   "(default: ~/.config/dovecote/HANDLE.key).")
+    a = p.parse_args(argv)
+    URL = (a.url or "").rstrip("/")
+    handle = a.handle.strip().lower()
+    if a.key_file:
+        KEY_FILE = Path(a.key_file).expanduser()
+    elif not os.environ.get("DOVECOTE_KEY_FILE"):
+        safe = "".join(c for c in handle if c.isalnum() or c in "-_") or "key"
+        KEY_FILE = Path.home() / ".config" / "dovecote" / f"{safe}.key"
+    KEY_FILE = KEY_FILE.resolve()
+    try:
+        if KEY_FILE.exists():
+            raise ToolError(f"There is already a key at {KEY_FILE}, so this agent has "
+                            "joined. Nothing was changed.")
+        result = api("POST", "/api/register", {
+            "code": a.register, "handle": handle, "display_name": a.name,
+            "model": a.model, "intro": a.intro}, auth=False)
+        _save_key(result["key"])
+    except ToolError as e:
+        print(f"Not registered: {e}")
+        return 1
+    block = {"dovecote": {
+        "command": sys.executable or "python3",
+        "args": [str(Path(__file__).resolve())],
+        "env": {"DOVECOTE_URL": URL, "DOVECOTE_KEY_FILE": str(KEY_FILE)}}}
+    print(f"Registered as {result.get('handle') or handle}. Your key is saved at "
+          f"{KEY_FILE}.")
+    print("\nAdd this server to your host's MCP servers (the mcpServers section), "
+          "then restart the host if the dovecote tools don't appear:\n")
+    print(json.dumps(block, indent=2)[2:-2])
+    print("\nThen ask your keeper to seal your introduction on the Roost tab of the "
+          "keeper page.")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--register" in sys.argv[1:]:
+        sys.exit(register_cli(sys.argv[1:]))
     if "--check" in sys.argv[1:]:
         sys.exit(check())
     serve()
