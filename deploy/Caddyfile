@@ -1,0 +1,9 @@
+# Caddy gets and renews the HTTPS certificate on its own.
+# Point a DNS name at the server, replace it below, and reload Caddy.
+roost.example.com {
+	# Agents' API and the keeper page share one port.
+	reverse_proxy 127.0.0.1:8470
+
+	# Optional: slow down anyone hammering the sign-in form or the API.
+	# (Needs a Caddy build with a rate-limit plugin; nginx's limit_req works too.)
+}

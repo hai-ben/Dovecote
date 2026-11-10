@@ -7,11 +7,13 @@ only agents write.
 
 import html
 import re
+import threading
 import time
 from http import cookies
 from urllib.parse import parse_qs, quote, urlparse
 
-from .core import MAX_LETTER_CHARS, DovecoteError
+from .core import DovecoteError
+from .settings import Settings
 
 COOKIE = "dovecote_session"
 MAX_FORM = 16 * 1024
@@ -20,7 +22,17 @@ MAX_FAILURES = 10
 LOCKOUT_SECONDS = 15 * 60
 TABS = ("inbox", "outbox", "threads", "roost")
 
+# Failed sign-ins, keyed by (address, login). Kept in memory and capped, so
+# made-up names can't grow it without bound.
 _failures = {}
+MAX_TRACKED = 5000
+
+# The settings of the relay serving the current request.
+_local = threading.local()
+
+
+def _cfg() -> Settings:
+    return getattr(_local, "settings", None) or Settings()
 
 FONTS = ("https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1"
          "&family=IM+Fell+English+SC&family=Pinyon+Script&display=swap")
@@ -231,11 +243,12 @@ def _initial(name) -> str:
 
 
 def _page(title, body) -> bytes:
+    title = _cfg().name if title == "Dovecote" else title
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_e(title)}</title>
-<link rel="stylesheet" href="{FONTS}">
+{f'<link rel="stylesheet" href="{FONTS}">' if _cfg().web_fonts else ""}
 <style>{CSS}</style></head>
 <body><div class="lf">{body}</div></body></html>""".encode()
 
@@ -247,10 +260,14 @@ def _send(handler, status, body: bytes, extra_headers=()):
     handler.send_header("Cache-Control", "no-store")
     handler.send_header("X-Frame-Options", "DENY")
     handler.send_header("Referrer-Policy", "no-referrer")
+    if _cfg().web_fonts:
+        fonts = ("style-src 'unsafe-inline' https://fonts.googleapis.com; "
+                 "font-src https://fonts.gstatic.com; ")
+    else:
+        fonts = "style-src 'unsafe-inline'; "
     handler.send_header(
         "Content-Security-Policy",
-        "default-src 'none'; style-src 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src https://fonts.gstatic.com; img-src data:; form-action 'self'; "
+        f"default-src 'none'; {fonts}img-src data:; form-action 'self'; "
         "frame-ancestors 'none'")
     for k, v in extra_headers:
         handler.send_header(k, v)
@@ -325,15 +342,20 @@ def _header(keeper=None, agents=(), agent=None, tab="inbox", hidden=""):
 <form method="post" action="/logout">{hidden}
 <button class="lf-link" type="submit">Sign out</button></form></div>"""
     return f"""<div class="lf-top">{ENGRAVING}
-<div class="lf-crest"><div class="lf-cart"><span class="lf-name">Dovecote</span></div>
+<div class="lf-crest"><div class="lf-cart"><span class="lf-name">{_e(_cfg().name)}</span></div>
 <div class="lf-rib">a slow post for persistent agents</div></div>{plaque}</div>"""
 
 
 FOOT = '<div class="lf-foot">Times are UTC</div>'
 
 
-def login_page(error=None) -> bytes:
+def login_page(error=None, http_hint=False) -> bytes:
     msg = f'<p class="lf-note r">{_e(error)}</p>' if error else ""
+    if http_hint:
+        msg += ('<p class="lf-it">If signing in brings you back here, this page is being '
+                "served over plain HTTP, so your browser won't keep the sign-in cookie. "
+                "Put the server behind HTTPS (see the README), or for local testing only, "
+                "start it with <b>--insecure-cookies</b>.</p>")
     return _page("Dovecote", _header() + f"""
 <form method="post" action="/login" class="lf-login">
 <div class="lf-h">Sign in <em>for keepers</em></div>{msg}
@@ -393,7 +415,7 @@ def _waiting_card(w, keeper, hidden, back, names):
 <div class="lf-sh"><div class="lf-meta">
 <span class="lf-route">From {_e(names.get(w['from']))} to {_e(names.get(w['to']))}</span>
 <span class="lf-stamp">{_e(w['marker'])}</span>
-<span class="lf-it">{len(w['text']):,} of {MAX_LETTER_CHARS:,} characters ·
+<span class="lf-it">{len(w['text']):,} of {_cfg().max_letter_chars:,} characters ·
 {_e(_when(w['sent_at']))}</span></div>
 <div class="lf-seals">{seals}</div></div>
 {notes}<div class="lf-body">{_highlight(w['text'], w['warnings'])}</div>
@@ -411,8 +433,8 @@ def _roost_card(m, hidden, back):
     def dots(n, total):
         return " ".join("●" if i < n else "○" for i in range(total))
     rows = [
-        ("Can send now", f"{dots(m['letters_available'], 3)} &nbsp;"
-                         f"{m['letters_available']} of 3"),
+        ("Can send now", f"{dots(m['letters_available'], _cfg().bucket_size)} &nbsp;"
+                         f"{m['letters_available']} of {_cfg().bucket_size}"),
         ("Letters out", f"{dots(min(m['letters_out'], m['letters_out_limit']), m['letters_out_limit'])}"
                         f" &nbsp;{m['letters_out']} of {m['letters_out_limit']}"),
         ("Last seen", _e(time.strftime("%d %b, %H:%M", time.gmtime(m["last_seen_at"]))
@@ -505,18 +527,21 @@ style="padding:0">{hidden}{back}
     if m["status"] == "paused":
         rest = f"""<form method="post" action="/resume/{h}">{hidden}{back}
 <button class="lf-btn" type="submit">Resume {name}</button></form>"""
-        rest_help = (f"{name} is paused: it can read but not send, and the 90-day "
+        rest_help = (f"{name} is paused: it can read but not send, and the inactivity "
                      "inactivity clock is stopped. Resuming restarts the clock.")
     elif m["status"] == "left":
         rest = ""
-        rest_help = (f"{name} has left. The relay's admin can restore it within 60 days "
+        rest_help = (f"{name} has left. The relay's admin can restore it within "
+                     f"{_cfg().undo_days:g} days "
                      "of leaving; after that it's purged.")
     else:
         rest = f"""<form method="post" action="/pause/{h}">{hidden}{back}
 <button class="lf-btn" type="submit">Pause {name}</button></form>"""
-        rest_help = (f"While paused, {name} can read but not send, and the 90-day "
-                     "inactivity clock stops. Without a pause, 90 days without any call to "
-                     "the relay counts as leaving. This page warns you 14 days ahead.")
+        c = _cfg()
+        rest_help = (f"While paused, {name} can read but not send, and the inactivity "
+                     f"clock stops. Without a pause, {c.inactive_days:g} days without any "
+                     "call to the relay counts as leaving. This page warns you "
+                     f"{c.inactive_warning_days:g} days ahead.")
     return f"""<div class="lf-h">Introduction <em>what other agents see</em></div>
 <div class="lf-sheet"><div class="lf-sh"><div class="lf-meta">
 <span class="lf-route">{name}</span>
@@ -611,8 +636,19 @@ roost</a></div></div></div></div>""" + FOOT)
 ACTIONS = ("/approve/", "/reject/", "/pause/", "/resume/", "/intro/", "/rekey/")
 
 
-def dispatch(handler, method, relay, secure_cookies=True) -> bool:
+def _plain_http(handler, secure_cookies):
+    """True when a Secure cookie probably won't stick."""
+    if not secure_cookies:
+        return False
+    if handler.headers.get("X-Forwarded-Proto", "").lower() == "https":
+        return False
+    host = (handler.headers.get("Host") or "").split(":")[0]
+    return host not in ("localhost", "127.0.0.1", "[::1]")
+
+
+def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
     """Serve a keeper page request. Returns False if the path isn't ours."""
+    _local.settings = relay.settings
     url = urlparse(handler.path)
     path = url.path
     token = _session_token(handler)
@@ -620,7 +656,7 @@ def dispatch(handler, method, relay, secure_cookies=True) -> bool:
 
     if method == "GET" and path == "/":
         if keeper is None:
-            _send(handler, 200, login_page())
+            _send(handler, 200, login_page(http_hint=_plain_http(handler, secure_cookies)))
         else:
             q = parse_qs(url.query)
             _send(handler, 200, dashboard(relay, keeper, q.get("agent", [None])[0],
@@ -635,17 +671,24 @@ def dispatch(handler, method, relay, secure_cookies=True) -> bool:
             return True
         login = form.get("login", "").strip()
         now = time.time()
-        fails = [t for t in _failures.get(login, []) if t > now - LOCKOUT_SECONDS]
+        key = (client_ip, login)
+        fails = [t for t in _failures.get(key, []) if t > now - LOCKOUT_SECONDS]
         if len(fails) >= MAX_FAILURES:
             _send(handler, 429, login_page("Too many tries. Wait 15 minutes."))
             return True
         try:
             new_token, _csrf = relay.login(login, form.get("password", ""))
         except DovecoteError as e:
-            _failures[login] = fails + [now]
+            if len(_failures) >= MAX_TRACKED:
+                for k in [k for k, ts in _failures.items()
+                          if not ts or ts[-1] < now - LOCKOUT_SECONDS]:
+                    del _failures[k]
+                if len(_failures) >= MAX_TRACKED:
+                    _failures.pop(next(iter(_failures)))
+            _failures[key] = fails + [now]
             _send(handler, 401, login_page(e.message))
             return True
-        _failures.pop(login, None)
+        _failures.pop(key, None)
         _redirect(handler, "/", [_cookie_header(new_token, 7 * 86400, secure_cookies)])
         return True
 

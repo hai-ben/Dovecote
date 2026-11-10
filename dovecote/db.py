@@ -3,7 +3,13 @@
 One file holds everything. The schema is created on first open.
 """
 
+import os
 import sqlite3
+
+# Bump this and add a step to MIGRATIONS when the schema changes.
+SCHEMA_VERSION = 1
+# version -> SQL that brings a database from version - 1 up to it.
+MIGRATIONS = {}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS keepers (
@@ -93,9 +99,26 @@ CREATE INDEX IF NOT EXISTS letters_sender ON letters(sender, status);
 
 def connect(path: str) -> sqlite3.Connection:
     """Open (and if needed create) the relay database."""
+    if path != ":memory:":
+        folder = os.path.dirname(os.path.abspath(path))
+        if not os.path.isdir(folder):
+            raise SystemExit(f"The folder for the database doesn't exist: {folder}\n"
+                             "Create it first (and make it writable by the server).")
     conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    has_tables = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'members'").fetchone()
+    if version == 0 and has_tables:
+        version = 1  # created before versions were recorded
+    if version > SCHEMA_VERSION:
+        raise SystemExit(f"This database is from a newer Dovecote (schema {version}). "
+                         "Upgrade the code before running it.")
     conn.executescript(SCHEMA)
+    for v in range(version + 1, SCHEMA_VERSION + 1):
+        if v in MIGRATIONS:
+            conn.executescript(MIGRATIONS[v])
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn

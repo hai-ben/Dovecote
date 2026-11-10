@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from . import filters, keeper
 from .core import DovecoteError, Relay
 from .db import connect
+from .settings import Settings
 
 MAX_BODY = 64 * 1024
 SWEEP_SECONDS = 3600
@@ -112,6 +113,17 @@ def intro(relay, handle, body, _query):
 class Handler(BaseHTTPRequestHandler):
     relay: Relay = None
     secure_cookies = True
+    behind_proxy = False
+    # Drop a client that stalls for this long, so it can't hold a thread.
+    timeout = 30
+
+    def client_ip(self):
+        """The visitor's address. Behind a proxy, the one it reports."""
+        if self.behind_proxy:
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            if forwarded:
+                return forwarded.split(",")[-1].strip()
+        return self.client_address[0]
     server_version = "Dovecote/1"
 
     def _reply(self, status, payload):
@@ -129,7 +141,8 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method):
         url = urlparse(self.path)
         if not url.path.startswith("/api/"):
-            if keeper.dispatch(self, method, self.relay, self.secure_cookies):
+            if keeper.dispatch(self, method, self.relay, self.secure_cookies,
+                               self.client_ip()):
                 return
         for m, pattern, auth, fn in ROUTES:
             match = pattern.match(url.path)
@@ -172,8 +185,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(relay: Relay, host: str, port: int, quiet: bool = False,
-                secure_cookies: bool = True) -> ThreadingHTTPServer:
-    attrs = {"relay": relay, "secure_cookies": secure_cookies}
+                secure_cookies: bool = True,
+                behind_proxy: bool = False) -> ThreadingHTTPServer:
+    attrs = {"relay": relay, "secure_cookies": secure_cookies,
+             "behind_proxy": behind_proxy}
     if quiet:
         attrs["log_message"] = lambda *_: None
     handler = type("BoundHandler", (Handler,), attrs)
@@ -191,15 +206,21 @@ def main(argv=None):
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8470)
     p.add_argument("--insecure-cookies", action="store_true",
-                   help="Allow keeper sign-in over plain HTTP (local testing only).")
+                   help="Allow keeper sign-in over plain HTTP (local testing only). "
+                        "Without it, the keeper page only works over HTTPS or on "
+                        "localhost in some browsers.")
+    p.add_argument("--behind-proxy", action="store_true",
+                   help="Trust the X-Forwarded-For header from a local proxy such as "
+                        "Caddy or nginx (used for sign-in rate limits).")
     args = p.parse_args(argv)
     relay = Relay(connect(args.db), check_out=filters.check_out,
-                  check_in=filters.check_in)
+                  check_in=filters.check_in, settings=Settings.from_env())
     relay.sweep()
     stop = threading.Event()
     threading.Thread(target=_sweeper, args=(relay, stop), daemon=True).start()
     server = make_server(relay, args.host, args.port,
-                         secure_cookies=not args.insecure_cookies)
+                         secure_cookies=not args.insecure_cookies,
+                         behind_proxy=args.behind_proxy)
     print(f"Dovecote relay on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
