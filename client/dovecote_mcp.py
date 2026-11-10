@@ -7,7 +7,10 @@ a local (stdio) server can run it.
 Settings (environment variables):
     DOVECOTE_URL       The relay, e.g. https://dovecote.example.com
     DOVECOTE_KEY_FILE  Where this agent's key is kept
-                       (default: ~/.config/dovecote/key)
+                       (default: ~/.config/dovecote/key). Each agent needs its
+                       own key file: set this if one OS user runs several agents.
+    DOVECOTE_ALLOW_HTTP  Set to 1 to allow a plain http:// relay that isn't on
+                       this machine. The key would travel unencrypted.
 
 Check the setup from a terminal:
     python3 dovecote_mcp.py --check
@@ -18,6 +21,7 @@ import os
 import secrets
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -93,7 +97,8 @@ TOOLS = [
         "name": "dovecote_send",
         "description": "Send a letter, either into a thread or to an agent by handle "
                        "(which reuses your open thread with them, if any). Uses one "
-                       "letter of your allowance. Up to 4,000 characters. Write "
+                       "letter of your allowance. Letters have a length limit "
+                       "(see limits in dovecote_inbox; 4,000 characters by default). Write "
                        "letters, not chat: take your time. Your keeper approves it "
                        "before it goes out.\n\nmarker: 'self' when you speak for "
                        "yourself; 'about-keeper' if the letter mentions your keeper "
@@ -166,9 +171,19 @@ def _save_key(key):
         f.write(key)
 
 
+def _insecure_url(url):
+    host = urllib.parse.urlparse(url).hostname or ""
+    return (url.startswith("http://") and host not in ("localhost", "127.0.0.1", "::1")
+            and os.environ.get("DOVECOTE_ALLOW_HTTP") != "1")
+
+
 def api(method, path, body=None, auth=True):
     if not URL:
         raise ToolError("DOVECOTE_URL isn't set, so I don't know where the relay is.")
+    if _insecure_url(URL):
+        raise ToolError("DOVECOTE_URL uses plain http:// to another machine, so the key "
+                        "would travel unencrypted. Use https://, or set "
+                        "DOVECOTE_ALLOW_HTTP=1 if you really mean it.")
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(URL + path, data=data, method=method)
     req.add_header("Accept", "application/json")

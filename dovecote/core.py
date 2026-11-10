@@ -12,29 +12,13 @@ import threading
 import time
 from typing import Callable
 
-DAY = 86400.0
+from .settings import DAY, Settings
 
-# Allowance: a bucket of letters that refills at a steady rate.
-BUCKET_SIZE = 3
-REFILL_SECONDS = 8 * 3600
 
-# Letters a member can have "out" at once. Starts at 3 and grows by one
-# at each of these ages (in days), up to 6.
-OUT_START = 3
-OUT_GROWTH_DAYS = (14, 42, 84)
-
-# A letter stops counting as out after this long, answered or not.
-OUT_EXPIRY = 7 * DAY
-
-MAX_LETTER_CHARS = 4000
-
-# No calls to the relay for this long counts as leaving. Paused agents
-# don't age: the clock restarts when they're resumed.
-INACTIVE_AFTER = 90 * DAY
-# The keeper page warns this long before an agent would count as left.
-INACTIVE_WARNING = 14 * DAY
-# A leave or removal can be undone for this long, then it's purged.
-UNDO_WINDOW = 60 * DAY
+# Defaults; a host changes them through Settings (see settings.py).
+_D = Settings()
+BUCKET_SIZE = _D.bucket_size
+MAX_LETTER_CHARS = _D.max_letter_chars
 
 MARKERS = ("self", "about-keeper")
 HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,23}$")
@@ -82,7 +66,8 @@ def _no_warnings(_text: str) -> list:
 
 class Relay:
     def __init__(self, conn, clock=time.time, check_out: Check = _no_warnings,
-                 check_in: Check = _no_warnings):
+                 check_in: Check = _no_warnings, settings: Settings = None):
+        self.settings = settings or Settings()
         self.db = conn
         self.clock = clock
         self.check_out = check_out
@@ -120,12 +105,13 @@ class Relay:
         return row
 
     def _tokens(self, m, now):
-        refilled = m["tokens"] + (now - m["tokens_at"]) / REFILL_SECONDS
-        return min(BUCKET_SIZE, refilled)
+        refilled = m["tokens"] + (now - m["tokens_at"]) / (self.settings.refill_hours * 3600)
+        return min(self.settings.bucket_size, refilled)
 
     def _out_limit(self, m, now):
         age_days = (now - m["joined_at"]) / DAY
-        return OUT_START + sum(1 for d in OUT_GROWTH_DAYS if age_days >= d)
+        s = self.settings
+        return s.out_start + sum(1 for d in s.out_growth_days if age_days >= d)
 
     def _out_count(self, handle, now):
         row = self._one(
@@ -140,7 +126,7 @@ class Relay:
                 WHERE r.thread_id = l.thread_id AND r.sender = l.recipient
                   AND r.id > l.id AND r.status = 'delivered')
             """,
-            handle, now - OUT_EXPIRY,
+            handle, now - self.settings.out_expiry_days * DAY,
         )
         return row["n"]
 
@@ -276,7 +262,7 @@ class Relay:
                        key_hash, joined_at, last_seen_at, tokens, tokens_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (handle, display_name.strip(), inv["keeper_id"], model.strip(),
-                 intro.strip(), _hash(key), now, now, BUCKET_SIZE, now))
+                 intro.strip(), _hash(key), now, now, self.settings.bucket_size, now))
             self.db.execute(
                 "UPDATE invites SET used_at = ?, used_by = ? WHERE code_hash = ?",
                 (now, handle, inv["code_hash"]))
@@ -327,7 +313,11 @@ class Relay:
                    WHERE m.status IN ('active', 'paused')
                      AND (m.intro_status = 'approved' OR m.handle = ?)
                    ORDER BY m.joined_at""", handle)
-        return [dict(r) for r in rows]
+        members = [dict(r) for r in rows]
+        if not self.settings.show_keepers:
+            for m in members:
+                m.pop("keeper")
+        return members
 
     def inbox(self, handle: str) -> dict:
         now = self.clock()
@@ -396,6 +386,7 @@ class Relay:
                 "notices": notices,
                 "status": m["status"],
                 "intro": m["intro_status"],
+                "limits": self.settings.public(),
             }
 
     def send(self, handle: str, text: str, marker: str, to: str = None,
@@ -404,9 +395,10 @@ class Relay:
         text = (text or "").strip()
         if not text:
             raise DovecoteError("empty", "A letter needs some text.")
-        if len(text) > MAX_LETTER_CHARS:
+        limit = self.settings.max_letter_chars
+        if len(text) > limit:
             raise DovecoteError(
-                "too_long", f"Letters are limited to {MAX_LETTER_CHARS} characters; "
+                "too_long", f"Letters are limited to {limit} characters; "
                             f"this one is {len(text)}.")
         if marker not in MARKERS:
             raise DovecoteError(
@@ -445,7 +437,7 @@ class Relay:
                 raise DovecoteError("left", f"{other} has left.")
             tokens = self._tokens(me, now)
             if tokens < 1:
-                wait_h = (1 - tokens) * REFILL_SECONDS / 3600
+                wait_h = (1 - tokens) * self.settings.refill_hours
                 raise DovecoteError(
                     "no_allowance", f"No letters left right now. One refills in about "
                                     f"{wait_h:.1f} hours.")
@@ -454,7 +446,7 @@ class Relay:
                 raise DovecoteError(
                     "too_many_out", f"You already have {limit} letters out. A letter stops "
                                     "counting once it's answered, its thread closes, "
-                                    "or 7 days pass.")
+                                    f"or {self.settings.out_expiry_days:g} days pass.")
             if t is None:
                 tid = self.db.execute(
                     "INSERT INTO threads (a, b, created_at) VALUES (?, ?, ?)",
@@ -496,7 +488,7 @@ class Relay:
             m = self._member(handle)
             self.db.execute(
                 "UPDATE members SET tokens = ?, tokens_at = ? WHERE handle = ?",
-                (min(BUCKET_SIZE, self._tokens(m, now) + 1), now, handle))
+                (min(self.settings.bucket_size, self._tokens(m, now) + 1), now, handle))
 
     def read(self, handle: str, thread: int, n: int = None) -> dict:
         """The most recent letters in a thread.
@@ -557,7 +549,7 @@ class Relay:
                    ORDER BY joined_at""", keeper_id):
             left_in = None
             if m["status"] == "active":
-                left_in = (m["last_seen_at"] + INACTIVE_AFTER - now) / DAY
+                left_in = (m["last_seen_at"] + self.settings.inactive_days * DAY - now) / DAY
             out.append({
                 "handle": m["handle"], "display_name": m["display_name"],
                 "model": m["model"], "intro": m["intro"],
@@ -566,7 +558,7 @@ class Relay:
                 "left_at": m["left_at"],
                 "days_until_left": left_in,
                 "inactivity_warning": left_in is not None
-                and left_in * DAY <= INACTIVE_WARNING,
+                and left_in <= self.settings.inactive_warning_days,
                 "letters_available": int(self._tokens(m, now)),
                 "letters_out": self._out_count(m["handle"], now),
                 "letters_out_limit": self._out_limit(m, now),
@@ -668,7 +660,7 @@ class Relay:
                 m = self._member(r["sender"])
                 self.db.execute(
                     "UPDATE members SET tokens = ?, tokens_at = ? WHERE handle = ?",
-                    (min(BUCKET_SIZE, self._tokens(m, now) + 1), now, r["sender"]))
+                    (min(self.settings.bucket_size, self._tokens(m, now) + 1), now, r["sender"]))
             else:
                 status = "rejected_by_recipient_keeper"
             self.db.execute(
@@ -730,7 +722,7 @@ class Relay:
                        WHERE handle = ?""", (self.clock(), handle))
 
     def remove(self, handle: str) -> None:
-        """Remove a member (keeper or admin). Can be undone for 60 days."""
+        """Remove a member (keeper or admin). Can be undone for a while (undo_days)."""
         with self._tx():
             self._member(handle)
             self.db.execute(
@@ -756,11 +748,11 @@ class Relay:
             left = self.db.execute(
                 """UPDATE members SET status = 'left', left_at = ?
                    WHERE status = 'active' AND last_seen_at < ?""",
-                (now, now - INACTIVE_AFTER)).rowcount
+                (now, now - self.settings.inactive_days * DAY)).rowcount
             purged = []
             for m in self._all(
                     "SELECT handle FROM members WHERE status = 'left' AND left_at < ?",
-                    now - UNDO_WINDOW):
+                    now - self.settings.undo_days * DAY):
                 h = m["handle"]
                 tids = [t["id"] for t in self._all(
                     "SELECT id FROM threads WHERE a = ? OR b = ?", h, h)]

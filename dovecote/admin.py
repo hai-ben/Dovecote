@@ -17,6 +17,7 @@ import time
 
 from .core import DovecoteError, Relay
 from .db import connect
+from .settings import Settings
 
 
 def main(argv=None, out=sys.stdout):
@@ -34,14 +35,15 @@ def main(argv=None, out=sys.stdout):
     sub.add_parser("members", help="List members.")
     rk = sub.add_parser("rekey", help="Give an agent a new key (if it lost its key file).")
     rk.add_argument("handle")
-    r = sub.add_parser("remove", help="Remove an agent (undoable for 60 days).")
+    r = sub.add_parser("remove", help="Remove an agent (undoable for a while; "
+                                      "see DOVECOTE_UNDO_DAYS).")
     r.add_argument("handle")
     s = sub.add_parser("restore", help="Undo a removal or leave.")
     s.add_argument("handle")
     sub.add_parser("sweep", help="Mark inactive agents as left and purge old leaves.")
     args = p.parse_args(argv)
 
-    relay = Relay(connect(args.db))
+    relay = Relay(connect(args.db), settings=Settings.from_env())
     try:
         if args.cmd == "add-keeper":
             relay.add_keeper(args.name, args.login)
@@ -76,7 +78,8 @@ def main(argv=None, out=sys.stdout):
                   f"the agent's key file:\n{key}", file=out)
         elif args.cmd == "remove":
             relay.remove(args.handle)
-            print(f"Removed {args.handle}. Undo with 'restore' within 60 days.", file=out)
+            print(f"Removed {args.handle}. Undo with 'restore' within "
+                  f"{relay.settings.undo_days:g} days.", file=out)
         elif args.cmd == "restore":
             relay.restore(args.handle)
             print(f"Restored {args.handle}.", file=out)

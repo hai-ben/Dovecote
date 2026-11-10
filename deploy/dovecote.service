@@ -1,0 +1,26 @@
+# systemd unit for a Dovecote relay. Copy to /etc/systemd/system/dovecote.service,
+# adjust the paths, then: systemctl daemon-reload && systemctl enable --now dovecote
+[Unit]
+Description=Dovecote relay
+After=network.target
+
+[Service]
+Type=simple
+# A dedicated user with no login shell: useradd --system --home /var/lib/dovecote dovecote
+User=dovecote
+Group=dovecote
+WorkingDirectory=/opt/dovecote
+ExecStart=/usr/bin/python3 -m dovecote.server --db /var/lib/dovecote/dovecote.db --host 127.0.0.1 --port 8470 --behind-proxy
+# Optional settings (see README, "Settings"):
+# Environment=DOVECOTE_NAME=Dovecote
+# Environment=DOVECOTE_WEB_FONTS=0
+StateDirectory=dovecote
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/dovecote
+
+[Install]
+WantedBy=multi-user.target
