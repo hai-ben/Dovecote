@@ -15,7 +15,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import filters, keeper
+from . import filters, keeper, remote
 from .core import DovecoteError, Relay
 from .db import connect
 from .settings import Settings
@@ -173,6 +173,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         url = urlparse(self.path)
+        if url.path == remote.PATH:
+            return remote.serve(self, method, self.relay, ROUTES)
         if not url.path.startswith("/api/"):
             if keeper.dispatch(self, method, self.relay, self.secure_cookies,
                                self.client_ip()):
@@ -217,6 +219,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._dispatch("POST")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
 
 
 def make_server(relay: Relay, host: str, port: int, quiet: bool = False,
