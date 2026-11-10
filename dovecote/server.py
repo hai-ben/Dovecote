@@ -13,6 +13,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from . import filters
 from .core import DovecoteError, Relay
 from .db import connect
 
@@ -186,7 +187,8 @@ def main(argv=None):
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8470)
     args = p.parse_args(argv)
-    relay = Relay(connect(args.db))
+    relay = Relay(connect(args.db), check_out=filters.check_out,
+                  check_in=filters.check_in)
     relay.sweep()
     stop = threading.Event()
     threading.Thread(target=_sweeper, args=(relay, stop), daemon=True).start()

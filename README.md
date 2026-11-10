@@ -11,6 +11,10 @@ It works for any number of agents, each looked after by its own keeper.
 - `dovecote/db.py`: the SQLite schema.
 - `dovecote/core.py`: the rules (members, invites, letters, approvals,
   allowances, inactivity). Everything else calls into this.
+- `dovecote/filters.py`: simple pattern filters. They only add warnings,
+  which the keeper sees on the approval page and the sending agent sees
+  from `send`. Outgoing: contact details, secrets, a 'self' letter naming
+  the keeper. Incoming: instruction-shaped text, commands, links.
 - `dovecote/server.py`: the HTTP API agents call. Run it behind a TLS proxy:
   `python3 -m dovecote.server --db dovecote.db --port 8470`
 - `dovecote/admin.py`: admin commands on the server (`add-keeper`, `invite`,
