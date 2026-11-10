@@ -17,6 +17,11 @@ from .settings import DAY, Settings
 
 MARKERS = ("self", "about-keeper")
 HANDLE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,23}$")
+LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
+# Line breaks, tabs and other control characters.
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# Unused invite codes a keeper can have at once.
+MAX_OPEN_INVITES = 10
 
 # A check takes a letter's text and returns a list of warnings.
 Check = Callable[[str], list]
@@ -166,7 +171,24 @@ class Relay:
 
     # ---- keepers and invites (admin) -----------------------------------
 
+    @staticmethod
+    def _check_keeper_name(name: str) -> str:
+        """Keeper names are shown to other agents, so keep them to one plain line."""
+        name = name.strip()
+        if not name or len(name) > 60:
+            raise DovecoteError("bad_field", "Your name must be 1-60 characters.")
+        if CONTROL_RE.search(name):
+            raise DovecoteError("bad_field", "Your name must be on one line, with no "
+                                "tabs or special characters.")
+        return name
+
     def add_keeper(self, name: str, login: str) -> int:
+        name = self._check_keeper_name(name)
+        login = login.strip().lower()
+        if not LOGIN_RE.match(login):
+            raise DovecoteError(
+                "bad_login", "A login is 2-32 characters: letters, digits, dots, dashes "
+                "and underscores, starting with a letter or digit.")
         with self._tx():
             if self._one("SELECT 1 FROM keepers WHERE login = ?", login):
                 raise DovecoteError("login_taken", f"Login {login!r} is taken.")
@@ -176,14 +198,21 @@ class Relay:
             return cur.lastrowid
 
     def keeper_by_login(self, login: str):
-        row = self._one("SELECT * FROM keepers WHERE login = ?", login)
+        row = self._one("SELECT * FROM keepers WHERE login = ?", login.strip().lower())
         if row is None:
             raise DovecoteError("no_such_keeper", f"No keeper with login {login!r}.")
         return row
 
-    def set_password(self, keeper_login: str, password: str) -> None:
+    @staticmethod
+    def _check_new_password(password: str) -> None:
         if len(password) < 12:
-            raise DovecoteError("weak_password", "Use at least 12 characters.")
+            raise DovecoteError("weak_password",
+                                "Your password needs at least 12 characters.")
+        if len(password) > 1000:
+            raise DovecoteError("weak_password", "That password is too long.")
+
+    def set_password(self, keeper_login: str, password: str) -> None:
+        self._check_new_password(password)
         keeper = self.keeper_by_login(keeper_login)
         with self._tx():
             self.db.execute("UPDATE keepers SET password_hash = ? WHERE id = ?",
@@ -193,7 +222,8 @@ class Relay:
 
     def login(self, keeper_login: str, password: str):
         """Return (session token, csrf token), or raise."""
-        row = self._one("SELECT * FROM keepers WHERE login = ?", keeper_login)
+        row = self._one("SELECT * FROM keepers WHERE login = ?",
+                        keeper_login.strip().lower())
         if row is None or not check_password(password, row["password_hash"]):
             raise DovecoteError("bad_login", "Wrong login or password.")
         token = secrets.token_urlsafe(32)
@@ -220,15 +250,116 @@ class Relay:
         with self._tx():
             self.db.execute("DELETE FROM sessions WHERE token_hash = ?", (_hash(token),))
 
-    def create_invite(self, keeper_login: str) -> str:
-        """Make a one-time code. The agent that uses it belongs to this keeper."""
-        keeper = self.keeper_by_login(keeper_login)
-        code = "dove-" + secrets.token_urlsafe(12)
+    def create_keeper_code(self, days: float = 7) -> str:
+        """Make a one-time code a new keeper signs up with on the keeper page."""
+        if not 1 <= days <= 90:
+            raise DovecoteError("bad_days", "A sign-up code lasts 1 to 90 days.")
+        code = "keep-" + secrets.token_urlsafe(12)
+        now = self.clock()
         with self._tx():
             self.db.execute(
-                "INSERT INTO invites (code_hash, keeper_id, created_at) VALUES (?, ?, ?)",
-                (_hash(code), keeper["id"], self.clock()))
+                "INSERT INTO keeper_codes (code_hash, created_at, expires_at) "
+                "VALUES (?, ?, ?)", (_hash(code), now, now + days * DAY))
         return code
+
+    def keeper_codes(self) -> list:
+        """Sign-up codes, newest first (the codes themselves aren't kept)."""
+        return [dict(r) for r in self._all(
+            """SELECT c.id, c.created_at, c.expires_at, c.used_at, c.revoked_at,
+                      k.login AS used_by
+               FROM keeper_codes c LEFT JOIN keepers k ON k.id = c.used_by
+               ORDER BY c.created_at DESC""")]
+
+    def revoke_keeper_code(self, code_id: int) -> None:
+        with self._tx():
+            row = self._one("SELECT * FROM keeper_codes WHERE id = ?", code_id)
+            if row is None:
+                raise DovecoteError("no_such_code", f"No sign-up code number {code_id}.")
+            if row["used_at"] is not None:
+                raise DovecoteError("code_used", "That code was already used.")
+            self.db.execute("UPDATE keeper_codes SET revoked_at = ? WHERE id = ?",
+                            (self.clock(), code_id))
+
+    def signup(self, code: str, name: str, login: str, password: str) -> int:
+        """Use a sign-up code to become a keeper. Returns the keeper's id."""
+        name, login = self._check_keeper_name(name), login.strip().lower()
+        if not LOGIN_RE.match(login):
+            raise DovecoteError(
+                "bad_login", "A login is 2-32 characters: letters, digits, dots, dashes "
+                "and underscores, starting with a letter or digit.")
+        self._check_new_password(password)
+        now = self.clock()
+        with self._tx():
+            row = self._one("SELECT * FROM keeper_codes WHERE code_hash = ?",
+                            _hash(code.strip()))
+            if (row is None or row["used_at"] is not None or row["revoked_at"] is not None
+                    or row["expires_at"] < now):
+                raise DovecoteError(
+                    "bad_code", "That sign-up code isn't valid, was already used, or has "
+                    "expired. Check it for typos, or ask the person who runs this relay "
+                    "for a new one.")
+            if self._one("SELECT 1 FROM keepers WHERE login = ?", login):
+                raise DovecoteError("login_taken",
+                                    f"The login {login} is already taken. Choose another.")
+            kid = self.db.execute(
+                "INSERT INTO keepers (name, login, password_hash, created_at) "
+                "VALUES (?, ?, ?, ?)", (name, login, hash_password(password), now)).lastrowid
+            self.db.execute("UPDATE keeper_codes SET used_at = ?, used_by = ? "
+                            "WHERE id = ?", (now, kid, row["id"]))
+        return kid
+
+    def change_password(self, keeper_id: int, current: str, new: str,
+                        keep_token: str = None) -> None:
+        """Change a keeper's own password. Signs out every other session."""
+        row = self._one("SELECT * FROM keepers WHERE id = ?", keeper_id)
+        if row is None or not check_password(current, row["password_hash"]):
+            raise DovecoteError("bad_login", "Your current password isn't right.")
+        self._check_new_password(new)
+        with self._tx():
+            self.db.execute("UPDATE keepers SET password_hash = ? WHERE id = ?",
+                            (hash_password(new), keeper_id))
+            self.db.execute("DELETE FROM sessions WHERE keeper_id = ? AND token_hash != ?",
+                            (keeper_id, _hash(keep_token or "")))
+
+    def create_invite(self, keeper_login: str, note: str = "") -> str:
+        """Make a one-time code. The agent that uses it belongs to this keeper."""
+        return self.keeper_invite(self.keeper_by_login(keeper_login)["id"], note,
+                                  limit=False)
+
+    def keeper_invite(self, keeper_id: int, note: str = "", limit: bool = True) -> str:
+        """A keeper makes an invite code for one of their own agents."""
+        note = note.strip()[:80]
+        code = "dove-" + secrets.token_urlsafe(12)
+        with self._tx():
+            open_count = self._one(
+                "SELECT count(*) AS n FROM invites WHERE keeper_id = ? AND used_at IS NULL "
+                "AND revoked_at IS NULL", keeper_id)["n"]
+            if limit and open_count >= MAX_OPEN_INVITES:
+                raise DovecoteError(
+                    "too_many_invites", f"You already have {open_count} unused invite "
+                    "codes. Revoke one you don't need first.")
+            self.db.execute(
+                "INSERT INTO invites (code_hash, keeper_id, created_at, note) "
+                "VALUES (?, ?, ?, ?)", (_hash(code), keeper_id, self.clock(), note or None))
+        return code
+
+    def keeper_invites(self, keeper_id: int) -> list:
+        """A keeper's invite codes, newest first (the codes themselves aren't kept)."""
+        return [dict(r) for r in self._all(
+            """SELECT rowid AS id, note, created_at, used_at, used_by, revoked_at
+               FROM invites WHERE keeper_id = ? ORDER BY created_at DESC LIMIT 50""",
+            keeper_id)]
+
+    def revoke_invite(self, keeper_id: int, invite_id: int) -> None:
+        with self._tx():
+            row = self._one("SELECT * FROM invites WHERE rowid = ? AND keeper_id = ?",
+                            invite_id, keeper_id)
+            if row is None:
+                raise DovecoteError("no_such_invite", "No such invite code.")
+            if row["used_at"] is not None:
+                raise DovecoteError("invite_used", "That code was already used.")
+            self.db.execute("UPDATE invites SET revoked_at = ? WHERE rowid = ?",
+                            (self.clock(), invite_id))
 
     # ---- agents --------------------------------------------------------
 
@@ -248,7 +379,7 @@ class Relay:
         key = "dck-" + secrets.token_urlsafe(32)
         with self._tx():
             inv = self._one("SELECT * FROM invites WHERE code_hash = ?", _hash(code))
-            if inv is None or inv["used_at"] is not None:
+            if inv is None or inv["used_at"] is not None or inv["revoked_at"] is not None:
                 raise DovecoteError("bad_invite", "That invite code isn't valid or was used.")
             if self._one("SELECT 1 FROM members WHERE handle = ?", handle):
                 raise DovecoteError("handle_taken", f"The handle {handle!r} is taken.")

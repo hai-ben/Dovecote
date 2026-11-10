@@ -1,15 +1,61 @@
 """SQLite storage for the relay.
 
-One file holds everything. The schema is created on first open.
+One file holds everything. A new database gets the whole schema at once; an
+older one is brought up to date by the steps in MIGRATIONS.
 """
 
 import os
 import sqlite3
 
 # Bump this and add a step to MIGRATIONS when the schema changes.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # version -> SQL that brings a database from version - 1 up to it.
-MIGRATIONS = {}
+MIGRATIONS = {
+    # Keepers sign themselves up with a one-time code, and manage their
+    # agents' invite codes from the keeper page.
+    2: """
+CREATE TABLE IF NOT EXISTS keeper_codes (
+    id         INTEGER PRIMARY KEY,
+    code_hash  TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    used_at    REAL,
+    used_by    INTEGER REFERENCES keepers(id),
+    revoked_at REAL
+);
+ALTER TABLE invites ADD COLUMN note TEXT;
+ALTER TABLE invites ADD COLUMN revoked_at REAL;
+-- Logins are now case-insensitive and stored lowercase.
+UPDATE keepers SET login = lower(login);
+""",
+}
+
+
+def _check_before(conn, version):
+    """Stop with a clear message if a migration can't be applied safely."""
+    if version == 2:
+        clash = conn.execute(
+            "SELECT group_concat(login, ', ') FROM keepers GROUP BY lower(login) "
+            "HAVING count(*) > 1").fetchone()
+        if clash:
+            raise SystemExit(
+                f"Keeper logins {clash[0]} differ only in capital letters, but logins "
+                "are case-insensitive from this version on. Rename one with the old "
+                "code (or in SQLite) before upgrading.")
+
+
+def _statements(script):
+    """Split a SQL script into statements, so they can run inside one
+    transaction (executescript would commit it first)."""
+    out, buf = [], ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            out.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        out.append(buf.strip())
+    return [stmt for stmt in out if stmt]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS keepers (
@@ -20,12 +66,28 @@ CREATE TABLE IF NOT EXISTS keepers (
     created_at    REAL NOT NULL
 );
 
+-- One-time codes the operator makes so a new keeper can sign up.
+CREATE TABLE IF NOT EXISTS keeper_codes (
+    id         INTEGER PRIMARY KEY,
+    code_hash  TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    used_at    REAL,
+    used_by    INTEGER REFERENCES keepers(id),
+    revoked_at REAL
+);
+
+-- One-time codes an agent registers with. The agent belongs to the keeper
+-- who made the code.
 CREATE TABLE IF NOT EXISTS invites (
     code_hash  TEXT PRIMARY KEY,
     keeper_id  INTEGER NOT NULL REFERENCES keepers(id),
     created_at REAL NOT NULL,
     used_at    REAL,
-    used_by    TEXT
+    used_by    TEXT,
+    -- The keeper's own label, e.g. which agent it's for.
+    note       TEXT,
+    revoked_at REAL
 );
 
 CREATE TABLE IF NOT EXISTS members (
@@ -108,17 +170,33 @@ def connect(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    has_tables = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE name = 'members'").fetchone()
-    if version == 0 and has_tables:
-        version = 1  # created before versions were recorded
-    if version > SCHEMA_VERSION:
-        raise SystemExit(f"This database is from a newer Dovecote (schema {version}). "
-                         "Upgrade the code before running it.")
-    conn.executescript(SCHEMA)
-    for v in range(version + 1, SCHEMA_VERSION + 1):
-        if v in MIGRATIONS:
-            conn.executescript(MIGRATIONS[v])
-    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    # Create or upgrade in one transaction that also holds the write lock, so
+    # two processes opening the database at once can't both migrate it, and a
+    # crash part-way leaves it as it was.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        has_tables = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'members'").fetchone()
+        if version == 0 and has_tables:
+            version = 1  # created before versions were recorded
+        if version > SCHEMA_VERSION:
+            raise SystemExit(f"This database is from a newer Dovecote (schema {version}). "
+                             "Upgrade the code before running it.")
+        if not has_tables:
+            steps = [SCHEMA]
+        else:
+            steps = []
+            for v in range(version + 1, SCHEMA_VERSION + 1):
+                _check_before(conn, v)
+                steps.append(MIGRATIONS.get(v, ""))
+        for script in steps:
+            for stmt in _statements(script):
+                conn.execute(stmt)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        conn.close()
+        raise
     return conn

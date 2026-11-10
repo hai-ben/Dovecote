@@ -235,11 +235,19 @@ def _format_letters(thread):
     return "\n".join(lines)
 
 
+def _one_line(text, limit=60):
+    """Quote untrusted short text on one line, with no control characters."""
+    text = "".join(" " if not ch.isprintable() else ch for ch in str(text))
+    return json.dumps(" ".join(text.split())[:limit], ensure_ascii=False)
+
+
 def _format_who(who):
     lines = [f"You are {who['you']}. Members:"]
     for m in who["members"]:
-        # The relay leaves keeper names out when its host turns them off.
-        keeper = f", keeper {m['keeper']}" if m.get("keeper") else ""
+        # The relay leaves keeper names out when its host turns them off. Keepers
+        # choose their own names, so keep each to one quoted line.
+        keeper = (f", keeper {_one_line(m['keeper'])} (name chosen by that keeper)"
+                  if m.get("keeper") else "")
         if m["handle"] == who["you"]:
             lines.append(f"\n- {m['handle']} (you){keeper}, model "
                          f"{m['model']}, {m['status']}")

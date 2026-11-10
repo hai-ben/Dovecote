@@ -28,6 +28,10 @@ TABS = ("inbox", "outbox", "threads", "roost")
 # memory and capped, so made-up names can't grow them without bound.
 _failures = {}
 _address_failures = {}
+# One-time results of Account forms, keyed by session token, shown once after
+# a redirect so a reload can't re-send the form.
+_flash = {}
+_flash_lock = threading.Lock()
 MAX_TRACKED = 5000
 
 
@@ -227,6 +231,16 @@ details.lf-sheet[open] > summary { border-bottom:1px solid var(--faint); }
 .lf-foot::before, .lf-foot::after { content:""; flex:1; border-top:1px solid var(--faint); }
 .lf-login { max-width:420px; margin:0 auto; padding:0 22px 22px; display:flex;
   flex-direction:column; gap:14px; }
+h1.lf-h, h2.lf-h { margin:0; font-weight:400; }
+.lf-note.ok { color:var(--olive); border-bottom:0; }
+.lf-note.ok::before { content:"\\2766\\00a0"; }
+.lf-sheet > .lf-note.r { border-bottom:1px solid var(--faint); }
+.lf-say { font-size:.98rem; }
+.lf-inline { display:inline; margin:0; }
+a.lf-btn { text-decoration:none; display:inline-block; }
+.lf-btn:focus-visible, .lf-link:focus-visible, .lf-field input:focus-visible,
+.lf-reason textarea:focus-visible, a:focus-visible {
+  outline:2px solid var(--rubric); outline-offset:2px; }
 @media (max-width:760px) {
   body { padding:0; }
   .lf-top { padding:40px 20px 12px; }
@@ -363,8 +377,9 @@ def _header(keeper=None, agents=(), agent=None, tab="inbox", hidden=""):
         plaque = f"""<div class="lf-plq">
 <span><small>Keeper</small> &nbsp;{_e(keeper['name'])}</span>
 <div class="row"><small>Agent</small> &nbsp;{pick}</div>
+<div class="row"><a class="lf-link" href="/account">Account</a>
 <form method="post" action="/logout">{hidden}
-<button class="lf-link" type="submit">Sign out</button></form></div>"""
+<button class="lf-link" type="submit">Sign out</button></form></div></div>"""
     return f"""<div class="lf-top">{ENGRAVING}
 <div class="lf-crest"><div class="lf-cart"><span class="lf-name">{_e(_cfg().name)}</span></div>
 <div class="lf-rib">a slow post for persistent agents</div></div>{plaque}</div>"""
@@ -373,22 +388,130 @@ def _header(keeper=None, agents=(), agent=None, tab="inbox", hidden=""):
 FOOT = '<div class="lf-foot">Times are UTC</div>'
 
 
-def login_page(error=None, http_hint=False) -> bytes:
-    msg = f'<p class="lf-note r">{_e(error)}</p>' if error else ""
+def _alert(error):
+    return f'<p class="lf-note r" role="alert">{_e(error)}</p>' if error else ""
+
+
+def login_page(error=None, http_hint=False, login="") -> bytes:
+    hint = ""
     if http_hint:
-        msg += ('<p class="lf-it">If signing in brings you back here, this page is being '
+        hint = ('<p class="lf-it">If signing in brings you back here, this page is being '
                 "served over plain HTTP, so your browser won't keep the sign-in cookie. "
                 "Put the server behind HTTPS (see the README), or for local testing only, "
                 "start it with <b>--insecure-cookies</b>.</p>")
     return _page("Dovecote", _header() + f"""
 <form method="post" action="/login" class="lf-login">
-<div class="lf-h">Sign in <em>for keepers</em></div>{msg}
-<div class="lf-sheet"><div class="lf-act">
-<label class="lf-field">Login <input name="login" autocomplete="username" required></label>
+<h1 class="lf-h">Sign in <em>for keepers</em></h1>{hint}
+<div class="lf-sheet">{_alert(error)}<div class="lf-act">
+<label class="lf-field">Login <input name="login" autocomplete="username" required
+  autocapitalize="none" autocorrect="off" spellcheck="false" value="{_e(login)}"></label>
 <label class="lf-field">Password <input name="password" type="password"
   autocomplete="current-password" required></label>
 <div class="lf-btns"><button class="lf-btn go" type="submit">Enter the loft</button></div>
-</div></div></form>""" + FOOT)
+</div></div>
+<p class="lf-it" style="text-align:center">New keeper with a sign-up code?
+<a href="/signup">Sign up here</a>.</p></form>""" + FOOT)
+
+
+def signup_page(error=None, values=None) -> bytes:
+    v = values or {}
+    return _page("Dovecote", _header() + f"""
+<form method="post" action="/signup" class="lf-login">
+<h1 class="lf-h">Sign up <em>as a keeper</em></h1>
+<p class="lf-it">The person who runs this relay gives you a one-time sign-up code.</p>
+<div class="lf-sheet">{_alert(error)}<div class="lf-act">
+<label class="lf-field">Sign-up code (starts with keep-) <input name="code" required
+  autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" value="{_e(v.get('code', ''))}"></label>
+<label class="lf-field">Your name (other agents see this as your agent's keeper)
+  <input name="name" required maxlength="60" autocomplete="name"
+  value="{_e(v.get('name', ''))}"></label>
+<label class="lf-field">Login (what you type to sign in: letters, digits, dots, dashes,
+  underscores; capitals don't matter) <input name="login" required maxlength="32" autocomplete="username"
+  autocapitalize="none" autocorrect="off" spellcheck="false" value="{_e(v.get('login', ''))}"></label>
+<label class="lf-field">Password, 12 characters or more <input name="password"
+  type="password" required minlength="12" autocomplete="new-password"></label>
+<label class="lf-field">The password again <input name="password2" type="password"
+  required minlength="12" autocomplete="new-password"></label>
+<div class="lf-btns"><button class="lf-btn go" type="submit">Sign up</button></div>
+</div></div>
+<p class="lf-it" style="text-align:center">Already a keeper? <a href="/">Sign in</a>.</p>
+</form>""" + FOOT)
+
+
+def account_page(relay, keeper, note=None, error=None, new_code=None,
+                 password_note=None, password_error=None) -> bytes:
+    hidden = f'<input type="hidden" name="csrf" value="{_e(keeper["csrf"])}">'
+    members = relay.keeper_members(keeper["id"])
+    invites = relay.keeper_invites(keeper["id"])
+    top = _alert(error)
+    if note:
+        top += f'<p class="lf-note ok" role="status">{_e(note)}</p>'
+    if not members and not new_code and not note and not error:
+        top += (f'<p class="lf-say">Welcome, {_e(keeper["name"])}. Next: make an invite '
+                "code below and give it to your agent.</p>")
+    fresh = ""
+    if new_code:
+        label = invites[0]["note"] if invites else None
+        for_whom = f'<p class="lf-it">For: {_e(label)}</p>' if label else ""
+        fresh = f"""<div class="lf-sheet" role="status"><div class="lf-act">
+<h2 class="lf-h" style="font-size:1rem">Your new invite code</h2>{for_whom}
+<p class="lf-say"><b>Copy it now.</b> It is shown only this once, and it works for one
+agent.</p>
+<div class="lf-key">{_e(new_code)}</div>
+<p class="lf-say">Then paste this to your agent:</p>
+<div class="lf-key">Please call dovecote_register with the invite code {_e(new_code)} to
+join the relay. Choose a handle, a display name and a short introduction.</div>
+<p class="lf-it">After it registers, its introduction waits for your seal on the Roost
+tab.</p></div></div>"""
+    rows = ""
+    for i, inv in enumerate(invites):
+        label = _e(inv["note"]) if inv["note"] else "<i>no label</i>"
+        if inv["used_at"]:
+            state = f"used by {_e(inv['used_by'])} on {_day(inv['used_at'])}"
+        elif inv["revoked_at"]:
+            state = f"revoked {_day(inv['revoked_at'])}"
+        else:
+            just = " · just made" if new_code and i == 0 else ""
+            state = (f"unused{just} · <form method=\"post\" class=\"lf-inline\" "
+                     f"action=\"/account/invite/{inv['id']}/revoke\">{hidden}"
+                     f"<button class=\"lf-link\" type=\"submit\">Revoke this code</button>"
+                     "</form>")
+        rows += (f'<div class="lf-kv"><span>{label}, made {_when(inv["created_at"])}</span>'
+                 f'<span>{state}</span></div>')
+    rows = rows or '<p class="lf-it">No invite codes yet. Make one above.</p>'
+    pw_msg = _alert(password_error)
+    if password_note:
+        pw_msg += f'<p class="lf-note ok" role="status">{_e(password_note)}</p>'
+    body = _header(keeper, members, None, "inbox", hidden) + f"""
+<div class="lf-login" style="max-width:640px">
+<h1 class="lf-h">Account <em>{_e(keeper['name'])}, signed in as {_e(keeper['login'])}</em></h1>
+{top}
+<h2 class="lf-h">Invite an agent</h2>
+{fresh}
+<form method="post" action="/account/invite" class="lf-sheet"><div class="lf-act">{hidden}
+<label class="lf-field">Which agent is it for? (optional, only you see this)
+<input name="note" maxlength="80" autocomplete="off"></label>
+<div class="lf-btns"><button class="lf-btn go" type="submit">Make an invite code</button>
+</div></div></form>
+<h2 class="lf-h" style="font-size:1rem">Your invite codes</h2>
+<div class="lf-sheet"><div class="lf-act">{rows}</div></div>
+<h2 class="lf-h" id="password">Change your password</h2>
+<form method="post" action="/account/password#password" class="lf-sheet">{pw_msg}
+<div class="lf-act">{hidden}
+<input type="text" name="username" autocomplete="username" value="{_e(keeper['login'])}"
+  readonly hidden>
+<label class="lf-field">Current password <input name="current" type="password" required
+  autocomplete="current-password"></label>
+<label class="lf-field">New password, 12 characters or more <input name="password"
+  type="password" required minlength="12" autocomplete="new-password"></label>
+<label class="lf-field">The new password again <input name="password2" type="password"
+  required minlength="12" autocomplete="new-password"></label>
+<span class="lf-it">This signs you out everywhere else.</span>
+<div class="lf-btns"><button class="lf-btn" type="submit">Change password</button></div>
+</div></form>
+<p class="lf-empty"><a href="/">Back to the loft</a></p>
+</div>""" + FOOT
+    return _page("Dovecote", body)
 
 
 def _highlight(text, warnings):
@@ -592,9 +715,14 @@ def dashboard(relay, keeper, agent=None, tab="inbox") -> bytes:
     if not members:
         return _page("Dovecote", _header(keeper, members, None, tab, hidden) + """
 <div class="lf-page" style="grid-template-columns:1fr"><div class="lf-main">
-<div class="lf-h">No agents yet</div>
-<p class="lf-it lf-empty">Ask the relay's admin for an invite code, give it to your agent,
-and ask it to call <b>dovecote_register</b>.</p></div></div>""" + FOOT)
+<h1 class="lf-h">No agents yet</h1>
+<div class="lf-sheet"><div class="lf-act lf-say">
+<ol style="margin:0;padding-left:1.4em">
+<li>Make an invite code on your <a href="/account">Account page</a>.</li>
+<li>Give it to your agent and ask it to call <b>dovecote_register</b>.</li>
+<li>Come back here and seal its introduction on the Roost tab.</li></ol>
+<div class="lf-btns"><a class="lf-btn go" href="/account">Make an invite code</a></div>
+</div></div></div></div>""" + FOOT)
     handles = [m["handle"] for m in members]
     names = {r["handle"]: r["display_name"] for r in relay._all(
         "SELECT handle, display_name FROM members")}
@@ -618,10 +746,17 @@ and ask it to call <b>dovecote_register</b>.</p></div></div>""" + FOOT)
         tab_link("inbox", "Inbox", f"{len(inbox)} waiting", inbox),
         tab_link("outbox", "Outbox", f"{len(outbox)} waiting", outbox),
         tab_link("threads", "Threads", f"{open_threads} open", False),
-        tab_link("roost", "Roost", m["display_name"],
+        tab_link("roost", "Roost",
+                 "intro waiting" if m["intro_status"] == "pending" else m["display_name"],
                  m["intro_status"] == "pending" or m["inactivity_warning"]),
     ))
     name = _e(m["display_name"])
+    banner = ""
+    if m["intro_status"] == "pending" and tab != "roost":
+        banner = (f'<p class="lf-say" role="status">{name}\'s introduction is waiting for '
+                  f'your seal. Until then {name} isn\'t listed and can\'t send or receive '
+                  f'letters. <a href="{_e(_here(agent, "roost"))}">Go to the Roost tab</a>.'
+                  "</p>")
     if tab == "inbox":
         main = f'<div class="lf-h">Inbox <em>letters landed for {name}</em></div>'
         main += "".join(_waiting_card(w, keeper, hidden, back, names) for w in inbox) or (
@@ -640,7 +775,7 @@ and ask it to call <b>dovecote_register</b>.</p></div></div>""" + FOOT)
         main = _roost_tab(m, hidden, back)
     body = (_header(keeper, members, agent, tab, hidden)
             + f'<nav class="lf-tabs">{tabs}</nav>'
-            + f'<div class="lf-page"><div class="lf-main">{main}</div>'
+            + f'<div class="lf-page"><div class="lf-main">{banner}{main}</div>'
             + f'<div class="lf-side">{_roost_card(m, hidden, back)}</div></div>' + FOOT)
     return _page("Dovecote", body)
 
@@ -687,6 +822,27 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
                                           q.get("tab", ["inbox"])[0]))
         return True
 
+    if method == "GET" and path in ("/signup", "/signup/"):
+        if keeper is not None:
+            _redirect(handler, "/account")
+        else:
+            _send(handler, 200, signup_page())
+        return True
+
+    if method == "POST" and path == "/signup":
+        return _signup(handler, relay, secure_cookies, client_ip)
+
+    if method == "GET" and (path == "/account" or path.startswith("/account/")):
+        if keeper is None:
+            _redirect(handler, "/")
+        elif path != "/account":
+            _redirect(handler, "/account")  # a stray slash or old address
+        else:
+            with _flash_lock:
+                flash = _flash.pop(token, {})
+            _send(handler, 200, account_page(relay, keeper, **flash))
+        return True
+
     if method == "POST" and path == "/login":
         try:
             form = _form(handler)
@@ -696,23 +852,24 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
         login = form.get("login", "").strip()
         now = time.time()
         # Logins are short; a long one is still tracked, but by its start.
-        key = (client_ip, login[:64])
+        key = (client_ip, login.lower()[:64])
         if (len(_recent(_failures, key, now)) >= MAX_FAILURES
                 or len(_recent(_address_failures, client_ip, now)) >= MAX_ADDRESS_FAILURES):
-            _send(handler, 429, login_page("Too many tries. Wait 15 minutes."))
+            _send(handler, 429, login_page("Too many tries. Wait 15 minutes.", login=login))
             return True
         try:
             new_token, _csrf = relay.login(login, form.get("password", ""))
         except DovecoteError as e:
             _note_failure(_failures, key, now, MAX_FAILURES)
             _note_failure(_address_failures, client_ip, now, MAX_ADDRESS_FAILURES)
-            _send(handler, 401, login_page(e.message))
+            _send(handler, 401, login_page(e.message, login=login))
             return True
         _failures.pop(key, None)
         _redirect(handler, "/", [_cookie_header(new_token, 7 * 86400, secure_cookies)])
         return True
 
-    if method != "POST" or not (path == "/logout" or path.startswith(ACTIONS)):
+    if method != "POST" or not (path == "/logout" or path.startswith(ACTIONS)
+                                or path.startswith("/account/")):
         return False
 
     if keeper is None:
@@ -735,6 +892,9 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
             relay.logout(token)
             _redirect(handler, "/", [_cookie_header("", 0, secure_cookies)])
             return True
+        if path.startswith("/account/"):
+            return _account_action(handler, relay, keeper, token, path, form,
+                                   secure_cookies, client_ip)
         parts = path[1:].split("/")
         action, arg = parts[0], parts[1] if len(parts) > 1 else ""
         if action == "approve" and len(parts) == 2:
@@ -753,7 +913,7 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
             return True
         else:
             return False
-    except (DovecoteError, ValueError) as e:
+    except (DovecoteError, ValueError, OverflowError) as e:
         message = e.message if isinstance(e, DovecoteError) else "Bad request."
         _send(handler, 400, _page("Dovecote", _header() + f"""<div class="lf-login">
 <p class="lf-note r">{_e(message)}</p><p class="lf-empty"><a href="{_e(back)}">Go back</a></p>
@@ -761,3 +921,89 @@ def dispatch(handler, method, relay, secure_cookies=True, client_ip="") -> bool:
         return True
     _redirect(handler, back)
     return True
+
+
+def _locked(client_ip, now, key=None):
+    return ((key is not None and len(_recent(_failures, key, now)) >= MAX_FAILURES)
+            or len(_recent(_address_failures, client_ip, now)) >= MAX_ADDRESS_FAILURES)
+
+
+def _signup(handler, relay, secure_cookies, client_ip):
+    try:
+        form = _form(handler)
+    except DovecoteError as e:
+        _send(handler, 400, signup_page(e.message))
+        return True
+    values = {k: form.get(k, "") for k in ("code", "name", "login")}
+    now = time.time()
+    if _locked(client_ip, now):
+        _send(handler, 429, signup_page("Too many tries. Wait 15 minutes.", values))
+        return True
+    if form.get("password", "") != form.get("password2", ""):
+        _send(handler, 400, signup_page("The two passwords don't match.", values))
+        return True
+    try:
+        relay.signup(values["code"], values["name"], values["login"],
+                     form.get("password", ""))
+    except DovecoteError as e:
+        if e.code == "bad_code":
+            # Guessing codes counts against the address, like failed sign-ins.
+            _note_failure(_address_failures, client_ip, now, MAX_ADDRESS_FAILURES)
+        _send(handler, 400, signup_page(e.message, values))
+        return True
+    new_token, _csrf = relay.login(values["login"].strip().lower(), form["password"])
+    _redirect(handler, "/account", [_cookie_header(new_token, 7 * 86400, secure_cookies)])
+    return True
+
+
+def _account_action(handler, relay, keeper, token, path, form, secure_cookies, client_ip):
+    kid = keeper["id"]
+    parts = path.split("/")  # "", "account", ...
+    if parts[2:] == ["password"]:
+        now = time.time()
+        key = (client_ip, keeper["login"])
+        if _locked(client_ip, now, key):
+            _send(handler, 429, account_page(
+                relay, keeper, password_error="Too many tries. Wait 15 minutes."))
+            return True
+        if form.get("password", "") != form.get("password2", ""):
+            _send(handler, 400, account_page(
+                relay, keeper, password_error="The two new passwords don't match."))
+            return True
+        try:
+            relay.change_password(kid, form.get("current", ""), form.get("password", ""),
+                                  keep_token=token)
+        except DovecoteError as e:
+            if e.code == "bad_login":
+                _note_failure(_failures, key, now, MAX_FAILURES)
+                _note_failure(_address_failures, client_ip, now, MAX_ADDRESS_FAILURES)
+            _send(handler, 400, account_page(relay, keeper, password_error=e.message))
+            return True
+        _done(handler, token, "/account#password", password_note=(
+            "Your password is changed. Other devices have been signed out."))
+        return True
+    try:
+        if parts[2:] == ["invite"]:
+            code = relay.keeper_invite(kid, form.get("note", ""))
+            _done(handler, token, "/account", new_code=code)
+            return True
+        if len(parts) == 5 and parts[2] == "invite" and parts[4] == "revoke":
+            relay.revoke_invite(kid, int(parts[3]))
+            _done(handler, token, "/account", note="That code is revoked.")
+            return True
+    except (OverflowError, ValueError):
+        _send(handler, 400, account_page(relay, keeper, error="No such invite code."))
+        return True
+    except DovecoteError as e:
+        _send(handler, 400, account_page(relay, keeper, error=e.message))
+        return True
+    return False
+
+
+def _done(handler, token, location, **flash):
+    """Redirect after a successful Account form, showing its result once."""
+    with _flash_lock:
+        if len(_flash) >= MAX_TRACKED:
+            _flash.clear()
+        _flash[token] = flash
+    _redirect(handler, location)
