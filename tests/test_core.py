@@ -29,8 +29,11 @@ class RelayTest(unittest.TestCase):
 
     def join(self, keeper, handle):
         code = self.relay.create_invite(keeper)
-        return self.relay.register(code, handle, handle.title(), "example-model",
-                                   f"Hello, I'm {handle}.")
+        key = self.relay.register(code, handle, handle.title(), "example-model",
+                                  f"Hello, I'm {handle}.")
+        kid = self.relay.keeper_by_login(keeper)["id"]
+        self.relay.approve_intro(kid, handle)
+        return key
 
     def deliver(self, sender, to, text="Hello there.", marker="self"):
         """Send a letter and have both keepers approve it."""
@@ -126,6 +129,7 @@ class LimitTest(RelayTest):
     def test_bucket_refills(self):
         code = self.relay.create_invite("alice")
         self.relay.register(code, "robin", "Robin", "m", "i")
+        self.relay.approve_intro(self.alice, "robin")
         self.relay.send("wren", "1", "self", to="finch")
         self.relay.send("wren", "2", "self", to="finch")
         self.relay.send("wren", "3", "self", to="robin")
@@ -149,7 +153,11 @@ class LimitTest(RelayTest):
     def test_reply_frees_slot(self):
         sent = self.deliver("wren", "finch")
         self.assertEqual(self.relay.inbox("wren")["letters_out"], 1)
-        self.relay.send("finch", "Hi back.", "self", thread=sent["thread"])
+        reply = self.relay.send("finch", "Hi back.", "self", thread=sent["thread"])
+        # A reply only frees the slot once it's delivered.
+        self.assertEqual(self.relay.inbox("wren")["letters_out"], 1)
+        self.relay.approve(self.bob, reply["letter"])
+        self.relay.approve(self.alice, reply["letter"])
         self.assertEqual(self.relay.inbox("wren")["letters_out"], 0)
 
     def test_out_limit_grows(self):
@@ -198,6 +206,77 @@ class ReadTest(RelayTest):
         self.assertEqual([l["text"] for l in alice_view["letters"]], ["one"])
         bob_view = self.relay.keeper_threads(self.bob)[0]
         self.assertEqual([l["text"] for l in bob_view["letters"]], ["one", "draft"])
+
+    def test_intro_needs_keeper_approval(self):
+        code = self.relay.create_invite("bob")
+        self.relay.register(code, "swift", "Swift", "m", "Hi.")
+        self.assertNotIn("swift", [m["handle"] for m in self.relay.who("wren")])
+        with self.assertRaises(DovecoteError) as e:
+            self.relay.send("swift", "Hello.", "self", to="wren")
+        self.assertEqual(e.exception.code, "intro_pending")
+        with self.assertRaises(DovecoteError):
+            self.relay.send("wren", "Hello.", "self", to="swift")
+        with self.assertRaises(DovecoteError) as e:
+            self.relay.approve_intro(self.alice, "swift")
+        self.assertEqual(e.exception.code, "not_yours")
+        self.relay.reject_intro(self.bob, "swift", "Say less about me.")
+        notices = self.relay.inbox("swift")["notices"]
+        self.assertEqual(notices[0]["reason"], "Say less about me.")
+        self.assertEqual(self.relay.inbox("swift")["notices"], [])
+        self.relay.set_intro("swift", "Hi, I'm Swift.")
+        self.assertEqual(self.relay.inbox("swift")["intro"], "pending")
+        self.relay.approve_intro(self.bob, "swift")
+        self.assertIn("swift", [m["handle"] for m in self.relay.who("wren")])
+        self.relay.send("swift", "Hello.", "self", to="wren")
+
+    def test_retract_refunds(self):
+        self.relay.check_out = lambda text: ["mentions a command"] if "sudo" in text else []
+        sent = self.relay.send("wren", "Try sudo.", "self", to="finch")
+        self.assertEqual(sent["warnings"], ["mentions a command"])
+        self.assertIn("dovecote_retract", sent["note"])
+        self.assertEqual(self.relay.inbox("wren")["letters_available"], 2)
+        self.relay.retract("wren", sent["letter"])
+        inbox = self.relay.inbox("wren")
+        self.assertEqual((inbox["letters_available"], inbox["letters_out"]), (3, 0))
+        self.assertEqual(self.relay.awaiting_keeper(self.alice), [])
+        with self.assertRaises(DovecoteError) as e:
+            self.relay.retract("wren", sent["letter"])
+        self.assertEqual(e.exception.code, "too_late")
+        other = self.relay.send("wren", "Plain.", "self", to="finch")
+        self.relay.approve(self.alice, other["letter"])
+        with self.assertRaises(DovecoteError):
+            self.relay.retract("wren", other["letter"])
+        with self.assertRaises(DovecoteError):
+            self.relay.retract("finch", other["letter"])
+
+    def test_waiting_on_keeper_count_and_read_state(self):
+        sent = self.relay.send("wren", "Hello.", "self", to="finch")
+        self.relay.approve(self.alice, sent["letter"])
+        self.assertEqual(self.relay.inbox("finch")["letters_waiting_on_your_keeper"], 1)
+        self.relay.approve(self.bob, sent["letter"])
+        self.assertEqual(self.relay.inbox("finch")["letters_waiting_on_your_keeper"], 0)
+
+        def letter(keeper):
+            return self.relay.keeper_threads(keeper)[0]["letters"][0]
+        self.assertIsNone(letter(self.bob)["read_at"])
+        self.relay.read("finch", sent["thread"])
+        self.assertIsNotNone(letter(self.bob)["read_at"])
+        # The sender's keeper doesn't see the other agent's read state.
+        self.assertIsNone(letter(self.alice)["read_at"])
+
+    def test_pause_stops_inactivity_clock(self):
+        self.relay.set_paused(self.alice, "wren", True)
+        self.clock.advance(120 * DAY)
+        self.relay.sweep()
+        self.assertEqual(self.relay.keeper_members(self.alice)[0]["status"], "paused")
+        self.relay.set_paused(self.alice, "wren", False)
+        m = self.relay.keeper_members(self.alice)[0]
+        self.assertAlmostEqual(m["days_until_left"], 90)
+        self.assertFalse(m["inactivity_warning"])
+        self.clock.advance(80 * DAY)
+        self.assertTrue(self.relay.keeper_members(self.alice)[0]["inactivity_warning"])
+        self.relay.authenticate(self.wren_key)
+        self.assertFalse(self.relay.keeper_members(self.alice)[0]["inactivity_warning"])
 
     def test_rekey(self):
         new = self.relay.rekey("wren")

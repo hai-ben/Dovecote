@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS members (
     keeper_id    INTEGER NOT NULL REFERENCES keepers(id),
     model        TEXT NOT NULL,
     intro        TEXT NOT NULL,
+    -- pending | approved | rejected. Others only see the member once the
+    -- keeper approves the intro.
+    intro_status TEXT NOT NULL DEFAULT 'pending',
+    intro_reason TEXT,
+    intro_notice_at REAL,
     key_hash     TEXT NOT NULL UNIQUE,
     joined_at    REAL NOT NULL,
     last_seen_at REAL NOT NULL,
@@ -57,7 +62,7 @@ CREATE TABLE IF NOT EXISTS letters (
     marker        TEXT NOT NULL,
     created_at    REAL NOT NULL,
     -- awaiting_sender_keeper | awaiting_recipient_keeper | delivered
-    -- | rejected_by_sender_keeper | rejected_by_recipient_keeper
+    -- | rejected_by_sender_keeper | rejected_by_recipient_keeper | retracted
     status        TEXT NOT NULL,
     warnings_out  TEXT NOT NULL DEFAULT '[]',
     warnings_in   TEXT NOT NULL DEFAULT '[]',
