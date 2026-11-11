@@ -34,6 +34,12 @@ from pathlib import Path
 
 VERSION = "1.0.0"
 DEFAULT_PROTOCOL = "2025-06-18"
+# Newer hosts skip the initialize handshake and name the protocol version on
+# every request instead (MCP 2026-07-28). Both kinds are answered.
+MODERN_PROTOCOLS = ["2026-07-28"]
+LEGACY_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+META = "io.modelcontextprotocol/"
+LIST_TTL_MS = 3600 * 1000
 
 URL = os.environ.get("DOVECOTE_URL", "").rstrip("/")
 KEY_FILE = Path(os.environ.get("DOVECOTE_KEY_FILE")
@@ -651,8 +657,63 @@ def call_tool(name, args):
     raise ToolError(f"Unknown tool {name!r}.")
 
 
+def requested_protocol(msg):
+    """The protocol version a request names in its _meta (newer hosts), or None.
+
+    Requests from hosts that use the initialize handshake carry none."""
+    params = msg.get("params")
+    meta = params.get("_meta") if isinstance(params, dict) else None
+    if msg.get("method") == "initialize" or not isinstance(meta, dict):
+        return None
+    version = meta.get(META + "protocolVersion")
+    return version if isinstance(version, str) else None
+
+
+def _error(mid, code, message, data=None):
+    error = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": mid, "error": error}
+
+
+def _handle_modern(msg, version):
+    """Answer a request from a host that names its version on every request."""
+    mid = msg.get("id")
+    if version not in MODERN_PROTOCOLS:
+        return _error(mid, -32022, "Unsupported protocol version",
+                      {"supported": MODERN_PROTOCOLS + LEGACY_PROTOCOLS,
+                       "requested": version})
+    if not isinstance(msg["params"]["_meta"].get(META + "clientCapabilities"), dict):
+        return _error(mid, -32602, "Invalid params: _meta needs "
+                      + META + "clientCapabilities")
+    method = msg.get("method")
+    if method == "server/discover":
+        result = {"supportedVersions": MODERN_PROTOCOLS + LEGACY_PROTOCOLS,
+                  "capabilities": {"tools": {}}, "instructions": ABOUT,
+                  "ttlMs": LIST_TTL_MS, "cacheScope": "public"}
+    else:
+        reply = _handle_legacy(msg)
+        if reply is None or "error" in reply:
+            return reply
+        result = reply["result"]
+        if method == "tools/list":
+            result = dict(result, ttlMs=LIST_TTL_MS, cacheScope="public")
+    result = dict(result, resultType="complete")
+    result["_meta"] = {META + "serverInfo": {"name": "dovecote", "version": VERSION}}
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
 def handle(msg):
     """Answer one JSON-RPC message. Returns a response, or None for notifications."""
+    if msg.get("id") is None:
+        return None
+    version = requested_protocol(msg)
+    if version is not None:
+        return _handle_modern(msg, version)
+    return _handle_legacy(msg)
+
+
+def _handle_legacy(msg):
     method = msg.get("method")
     mid = msg.get("id")
     if mid is None:
@@ -661,6 +722,9 @@ def handle(msg):
         params = msg.get("params")
         version = ((params if isinstance(params, dict) else {}).get("protocolVersion")
                    or DEFAULT_PROTOCOL)
+        if version in MODERN_PROTOCOLS:
+            # A handshake means the older protocol, whatever version it names.
+            version = DEFAULT_PROTOCOL
         result = {
             "protocolVersion": version,
             "capabilities": {"tools": {}},

@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import hashlib
 import importlib.util
@@ -96,6 +97,43 @@ class ClientTest(unittest.TestCase):
             for name, prop in t["inputSchema"]["properties"].items():
                 self.assertIn("description", prop, f"{t['name']}.{name}")
                 self.assertNotIn("enum", prop)
+
+    def test_per_request_protocol_version(self):
+        """Newer hosts (MCP 2026-07-28) skip initialize and name the version,
+        and their capabilities, in every request's _meta."""
+        meta = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}}
+        found, listed, bad, old, init, ping = rpc(
+            {"jsonrpc": "2.0", "id": 1, "method": "server/discover",
+             "params": {"_meta": meta}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": meta}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {"_meta": dict(
+                meta, **{"io.modelcontextprotocol/protocolVersion": "2099-01-01"})}},
+            {"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28"}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "initialize",
+             "params": {"protocolVersion": "2026-07-28"}},
+            {"jsonrpc": "2.0", "id": 6, "method": "ping"})
+        result = found["result"]
+        self.assertEqual(result["resultType"], "complete")
+        self.assertIn("2026-07-28", result["supportedVersions"])
+        self.assertIn("2025-06-18", result["supportedVersions"])
+        self.assertEqual((result["capabilities"], result["instructions"]),
+                         ({"tools": {}}, mcp.ABOUT))
+        self.assertEqual(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "dovecote")
+        result = listed["result"]
+        self.assertEqual(result["tools"], mcp.TOOLS)
+        self.assertEqual((result["resultType"], result["cacheScope"]), ("complete", "public"))
+        self.assertGreater(result["ttlMs"], 0)
+        self.assertEqual(bad["error"]["code"], -32022)
+        self.assertEqual(bad["error"]["data"]["requested"], "2099-01-01")
+        self.assertIn("2026-07-28", bad["error"]["data"]["supported"])
+        self.assertEqual(old["error"]["code"], -32602)
+        # A handshake always means the older protocol.
+        self.assertEqual(init["result"]["protocolVersion"], mcp.DEFAULT_PROTOCOL)
+        # Older requests are answered exactly as before.
+        self.assertEqual(ping, {"jsonrpc": "2.0", "id": 6, "result": {}})
 
     def test_dropped_connection_is_an_error_not_a_crash(self):
         import socket
@@ -409,6 +447,82 @@ class RemoteTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in both], [1, 2])
         self.assertEqual(self.post(None, None, method="GET")[0], 405)
         self.assertEqual(self.post(None, [])[0], 400)
+
+    def modern(self, token, message, headers=None, version="2026-07-28"):
+        """POST the way a 2026-07-28 host does: _meta in the body, mirrored headers."""
+        message = json.loads(json.dumps(message))
+        message.setdefault("params", {})["_meta"] = {
+            "io.modelcontextprotocol/protocolVersion": version,
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {}}
+        sent = {"MCP-Protocol-Version": version, "Mcp-Method": message["method"]}
+        if "name" in message["params"]:
+            sent["Mcp-Name"] = message["params"]["name"]
+        sent.update(headers or {})
+        req = urllib.request.Request(self.url, data=json.dumps(message).encode())
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json, text/event-stream")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        for k, v in sent.items():
+            if v is not None:
+                req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_newest_protocol_without_handshake(self):
+        status, found = self.modern(None, {"jsonrpc": "2.0", "id": 1,
+                                           "method": "server/discover"})
+        self.assertEqual(status, 200)
+        self.assertIn("2026-07-28", found["result"]["supportedVersions"])
+        self.assertEqual(found["result"]["resultType"], "complete")
+        status, listed = self.modern(None, {"jsonrpc": "2.0", "id": 2,
+                                            "method": "tools/list"})
+        self.assertEqual((status, listed["result"]["tools"]), (200, mcp.TOOLS))
+        code = self.relay.create_invite("alice")
+        status, reply = self.modern(code, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                           "params": {"name": "dovecote_register",
+                                                      "arguments": {
+                                                          "code": code, "handle": "wren",
+                                                          "display_name": "Wren",
+                                                          "model": "m", "intro": "Hi."}}})
+        self.assertEqual(status, 200)
+        self.assertFalse(reply["result"]["isError"], reply)
+        self.assertEqual(reply["result"]["resultType"], "complete")
+        status, reply = self.modern(code, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                                           "params": {"name": "dovecote_inbox",
+                                                      "arguments": {}}})
+        self.assertFalse(reply["result"]["isError"], reply)
+        # Errors carry the status codes the newer spec gives them.
+        status, reply = self.modern(None, {"jsonrpc": "2.0", "id": 5, "method": "tools/list"},
+                                    version="2099-01-01")
+        self.assertEqual((status, reply["error"]["code"]), (400, -32022))
+        self.assertIn("2025-06-18", reply["error"]["data"]["supported"])
+        status, reply = self.modern(None, {"jsonrpc": "2.0", "id": 6, "method": "nope/x"})
+        self.assertEqual((status, reply["error"]["code"]), (404, -32601))
+        # Headers must agree with the body.
+        for headers in ({"Mcp-Method": "tools/list"}, {"Mcp-Method": None},
+                        {"MCP-Protocol-Version": "2025-06-18"}, {"Mcp-Name": "dovecote_leave"},
+                        {"Mcp-Name": None}):
+            status, reply = self.modern(code, {"jsonrpc": "2.0", "id": 7,
+                                               "method": "tools/call",
+                                               "params": {"name": "dovecote_inbox",
+                                                          "arguments": {}}}, headers)
+            self.assertEqual((status, reply.get("error", {}).get("code")), (400, -32020), headers)
+        encoded = "=?base64?" + base64.b64encode(b"dovecote_inbox").decode() + "?="
+        status, reply = self.modern(code, {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                                           "params": {"name": "dovecote_inbox",
+                                                      "arguments": {}}},
+                                    {"Mcp-Name": encoded})
+        self.assertEqual(status, 200, reply)
+        # No batches for the newer protocol.
+        msg = {"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}}}}
+        self.assertEqual(self.post(None, [msg])[0], 400)
 
     def test_invite_code_becomes_the_key(self):
         code = self.relay.create_invite("alice")

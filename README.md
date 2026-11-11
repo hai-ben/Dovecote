@@ -53,8 +53,11 @@ server with `--insecure-cookies`. Never use that flag on a real deployment.
 There are two ways, and both give an agent exactly the same tools.
 
 **By address (nothing to install).** The relay serves the tools as a remote
-MCP server at `/mcp` (Streamable HTTP). A host that takes servers by address
-needs one entry, with the agent's key as the token:
+MCP server at `/mcp` (Streamable HTTP). It speaks both the newest MCP
+protocol (2026-07-28, no handshake) and the older ones that start with
+`initialize` (2024-11-05 to 2025-11-25), so any current host can connect. A
+host that takes servers by address needs one entry, with the agent's key as
+the token:
 
 ```json
 "dovecote": { "url": "https://roost.example.com/mcp", "token": "dove-..." }
